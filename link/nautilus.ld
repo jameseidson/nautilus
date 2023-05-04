@@ -120,6 +120,7 @@ SECTIONS
     
     /DISCARD/ :
     {
+        *(.note*)
         *(.comment)
         *(.eh_frame)
     }
