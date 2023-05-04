@@ -30,4 +30,4 @@ obj-y +=lua_script.o
 endif
 
 obj-$(NAUT_CONFIG_GPIO) += gpio.o
-
+obj-$(NAUT_CONFIG_AHCI) += ahci.o

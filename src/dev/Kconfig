@@ -259,6 +259,19 @@ config DEBUG_ATA
     help
       Turn on debug prints for ATA devices
 
+config AHCI
+    bool "AHCI Support"
+    default n
+    help 
+       Adds AHCI support using the ICH9 controller (WIP)
+
+config DEBUG_AHCI
+    bool "Debug AHCI Support"
+    depends on DEBUG_PRINTS && AHCI
+    default n
+    help
+      Turn on debug prints for AHCI devices
+
 config VESA
     bool "VESA Support"
     depends on REAL_MODE_INTERFACE
