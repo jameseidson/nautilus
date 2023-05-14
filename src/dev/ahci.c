@@ -28,6 +28,8 @@
 #define HBA_PORT_IPM_ACTIVE 1
 #define HBA_PORT_DET_DETECTED 3
 
+// AHCI REGISTER DECLARATIONS
+
 typedef volatile struct {
     union {
       uint64_t val;
@@ -247,41 +249,42 @@ typedef struct {
   uint32_t rsv2;          // Reserved
 } __attribute__((packed)) fis_dma_setup_t;
 
-struct ahci_blkdev_state {
-  struct nk_blk_dev *blkdev;
+// BLOCK DEVICE INTERFACE
+
+static int get_characteristics(void *state, struct nk_block_dev_characteristics *c);
+static int read_blocks(void *state, uint64_t blocknum, uint64_t count, uint8_t *dest,void (*callback)(nk_block_dev_status_t, void *), void *context);
+static int write_blocks(void *state, uint64_t blocknum, uint64_t count, uint8_t *src,void (*callback)(nk_block_dev_status_t, void *), void *context);
+
+static struct nk_block_dev_int interface = 
+{
+    .get_characteristics = get_characteristics,
+    .read_blocks = read_blocks,
+    .write_blocks = write_blocks,
 };
 
-struct ahci_controller_state {
-  hba_reg_t *abar;   // ahci base address register
-  
-  // struct pci_dev *pci_dev;   // pci interrupt and interrupt vector
-  // struct list_head node;     // device list
+// LOCAL STATE DECLARATIONS
 
-  // uint64_t  mem_start;       // Where registers are mapped into the physical memory address space
-  // uint64_t  mem_end;
-};
+typedef struct ahci_blkdev_state {
+  struct nk_block_dev *blkdev;
 
-static struct list_head dev_list;
+  ahci_dev_t type;
+  uint8_t port;
+  struct ahci_controller_state *controller;
+} ahci_blkdev_state_t;
+
+typedef struct ahci_controller_state {
+  hba_reg_t *abar;            // ahci base address register
+  struct ahci_blkdev_state devs[32];
+} ahci_controller_state_t;
+
 static struct ahci_controller_state controller;
 
-int get_dev_type(hba_port_reg_t *port) {
-  if (port->ssts.det != HBA_PORT_DET_DETECTED) return AHCI_DEV_NULL;
-  if (port->ssts.ipm != HBA_PORT_IPM_ACTIVE)   return AHCI_DEV_NULL;
+// FUNCTION DEFINITIONS
 
-  switch (port->sig) {
-    case SATA_SIG_ATAPI: return AHCI_DEV_SATAPI;
-    case SATA_SIG_SEMB:  return AHCI_DEV_SEMB;
-    case SATA_SIG_PM:    return AHCI_DEV_PM;
-    default:             return AHCI_DEV_SATA;
-  }
-}
-
-int controller_init(struct naut_info* naut) {
+static int controller_init(struct naut_info* naut) {
   struct pci_info *pci = naut->sys.pci;
   struct list_head *curbus, *curdev;
   uint32_t num = 0;
-
-  INIT_LIST_HEAD(&dev_list);
 
   if (!pci) {
     ERROR("no PCI info\n");
@@ -310,8 +313,6 @@ int controller_init(struct naut_info* naut) {
         }
 
         controller.abar = (hba_reg_t *)pci_dev_get_bar_addr(pdev, 5);
-        
-        DEBUG("device has %u ports and implements ports (one-hot): %x\n", controller.abar->cap.np, controller.abar->pi);
       }
     }
   }
@@ -319,28 +320,43 @@ int controller_init(struct naut_info* naut) {
   return 0;
 }
 
-int probe_ports() {
+static ahci_dev_t get_dev_type(hba_port_reg_t *port) {
+  if (port->ssts.det != HBA_PORT_DET_DETECTED) return AHCI_DEV_NULL;
+  if (port->ssts.ipm != HBA_PORT_IPM_ACTIVE)   return AHCI_DEV_NULL;
+
+  switch (port->sig) {
+    case SATA_SIG_ATAPI: return AHCI_DEV_SATAPI;
+    case SATA_SIG_SEMB:  return AHCI_DEV_SEMB;
+    case SATA_SIG_PM:    return AHCI_DEV_PM;
+    default:             return AHCI_DEV_SATA;
+  }
+}
+
+static void blkdev_init(int port) {
+  ahci_dev_t type = get_dev_type(&controller.abar->ports[port]);
+  if (type == AHCI_DEV_NULL) return;
+  
+  ahci_blkdev_state_t *s = &(controller.devs[port]);
+
+  char name[32];
+  sprintf(name, "ahci-%d-%d\n", port, type);
+
+  s->type = type;
+  s->port = port;
+  s->controller = &controller;
+  s->blkdev = nk_block_dev_register(name, 0, &interface, s);
+
+  INFO("initialized block device: %s\n", name);
+}
+
+
+static int probe_ports() {
   DEBUG("probing ahci ports\n");
 
   uint32_t pi = controller.abar->pi;
   for (int i = 0; i < 32; i++) {
     if (pi & 1) { 
-      int devty = get_dev_type(&controller.abar->ports[i]);
-      switch (devty) {
-        case AHCI_DEV_SATA: {
-          INFO("SATA drive found at port %d\n", i);
-          break;
-        } case AHCI_DEV_SATAPI: {
-          INFO("SATAPI drive found at port %d\n", i);
-          break;
-        } case AHCI_DEV_SEMB: {
-          INFO("Enclosure management bridge found at port %d\n", i);
-          break;
-        } case AHCI_DEV_PM: {
-          INFO("Port multiplier found at port %d\n", i);
-          break;
-        } default: break;
-      }
+      blkdev_init(i);
       pi >>= 1;
     }
   }
@@ -354,5 +370,17 @@ int nk_ahci_init(struct naut_info* naut) {
   if (controller_init(naut)) return -1;
   if (probe_ports())         return -1;
 
+  return 0;
+}
+
+static int get_characteristics(void *state, struct nk_block_dev_characteristics *c) {
+  return 0;
+}
+
+static int read_blocks(void *state, uint64_t blocknum, uint64_t count, uint8_t *dest,void (*callback)(nk_block_dev_status_t, void *), void *context) {
+  return 0;
+}
+
+static int write_blocks(void *state, uint64_t blocknum, uint64_t count, uint8_t *src,void (*callback)(nk_block_dev_status_t, void *), void *context) {
   return 0;
 }
