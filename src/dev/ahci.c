@@ -17,10 +17,6 @@
 #define DEBUG(fmt, args...) DEBUG_PRINT("ahci: " fmt, ##args)
 #define INFO(fmt, args...) INFO_PRINT("ahci: " fmt, ##args)
 
-#define STATE_LOCK_CONF uint8_t _state_lock_flags
-#define STATE_LOCK(state) _state_lock_flags = spin_lock_irq_save(&state->lock)
-#define STATE_UNLOCK(state) spin_unlock_irq_restore(&(state->lock), _state_lock_flags)
-
 // AHCI Controller
 #define INTEL_VENDOR_ID     0x8086  // intel
 #define ICH9_DEVICE_ID      0x2922  // ICH9
@@ -28,6 +24,9 @@
 #define CONTROLLER_SUBCLASS 0x06    // serial ATA
 
 #define PORT_MASK(p, field) (((field) & (1u << (p))) >> (p))
+
+#define CMD_LIST_SIZE 32
+#define CMD_TBL_NUM_PRDT 1
 
 #define HBA_MAX_PORTS 32
 #define HBA_PORT_IPM_ACTIVE 1
@@ -202,13 +201,19 @@ typedef struct {
 
   // 0x80
   struct {
-    uint32_t dba;		   // Data base address
-    uint32_t dbau;		 // Data base address upper 32 bits
+    union {
+      void *dba;
+      struct {
+        uint32_t dba_l;		   // Data base address lower 32 bits
+        uint32_t dba_u;		   // Data base address upper 32 bits
+      } __attribute__((packed));
+    };                 // Data base address
+
     uint32_t rsv0;		 // Reserved
     uint32_t dbc:22;	 // Byte count, 4M max
     uint32_t rsv1:9;	 // Reserved
     uint32_t i:1;		   // Interrupt on completion
-  } __attribute__((packed)) prdt_entry[1];  // Physical region descriptor table entries, 0 ~ 65535
+  } __attribute__((packed)) prdt_entry[CMD_TBL_NUM_PRDT];  // Physical region descriptor table entries, 0 ~ 65535
 } __attribute__((packed)) cmd_table_t;
 
 typedef struct {
@@ -262,7 +267,32 @@ typedef volatile struct {
     };                         // fis base address 
 
     uint32_t is;		           // 0x10, interrupt status
-    uint32_t ie;		           // 0x14, interrupt enable
+
+    union {
+      uint32_t val;
+      struct {
+        uint8_t dhre   : 1;  // device to host register fis interrupt enable
+        uint8_t pse    : 1;  // pio setup fis interrupt enable
+        uint8_t dse    : 1;  // dma setup fis interrupt enable
+        uint8_t sdbe   : 1;  // set device bits fis interrupt enable
+        uint8_t ufe    : 1;  // unknown fis interrupt enable
+        uint8_t dpe    : 1;  // descriptor processed interrupt enable
+        uint8_t pce    : 1;  // port change interrupt enable
+        uint8_t dmpe   : 1;  // device mechanical presence enable
+        uint16_t rsv0  : 14; // reserved
+        uint8_t prce   : 1;  // phyrdy change interrupt enable
+        uint8_t ipme   : 1;  // incorrect port multiplier enable
+        uint8_t ofe    : 1;  // overflow enable
+        uint8_t rsv1   : 1;  // reserved
+        uint8_t infe   : 1;  // interface non-fatal error enable
+        uint8_t ife    : 1;  // interface fatal error enable
+        uint8_t hbde   : 1;  // host bus data error enable
+        uint8_t hbfe   : 1;  // host bus fatal error enable
+        uint8_t tfee   : 1;  // task file error enable
+        uint8_t cpde   : 1;  // cold presence detect enable
+      } __attribute__((packed));
+    } ie;		                   // 0x14, interrupt enable
+
     uint32_t cmd;		           // 0x18, command and status
     uint32_t rsv0;		         // 0x1C, Reserved
     uint32_t tfd;		           // 0x20, task file data
@@ -315,7 +345,17 @@ typedef volatile struct {
     } __attribute__((packed));
   } cap;                       // 0x00, Host Capability
 
-  uint32_t ghc;                // 0x04, Global host control
+  union {
+    uint32_t val;
+    struct {
+      uint8_t  hr   : 1;  // hba reset
+      uint8_t  ie   : 1;  // interrupt enable
+      uint8_t  mrsm : 1;  // msi revert to single message
+      uint32_t rsvd : 28; // reserved
+      uint8_t  ae   : 1;  // ahci enable
+    } __attribute__((packed));
+  } ghc;            // 0x04, Global host control
+
   uint32_t is;                 // 0x08, Interrupt status
   uint32_t pi;		             // 0x0C, Port implemented
   uint32_t vs;		             // 0x10, Version
@@ -351,34 +391,37 @@ static struct nk_block_dev_int interface =
 
 // LOCAL STATE DECLARATIONS
 
-typedef struct ahci_blkdev_state {
+typedef struct ahci_port_state {
   struct nk_block_dev *blkdev;
-
   ahci_dev_t type;
 
   uint8_t portn;
+  hba_port_reg_t *regs;
+
+  spinlock_t cmdlock;
   
   struct ahci_controller_state *controller;
-} ahci_blkdev_state_t;
+} ahci_port_state_t;
 
 typedef struct ahci_controller_state {
   hba_reg_t *abar;  // ahci base address register
   
-  struct ahci_blkdev_state devs[HBA_MAX_PORTS];
+  struct ahci_port_state devs[HBA_MAX_PORTS];
 } ahci_controller_state_t;
 
-static struct ahci_controller_state controller;
+// static struct ahci_controller_state controller;
 
 // FUNCTION DEFINITIONS
 
-static int controller_init(struct naut_info* naut) {
+static ahci_controller_state_t *controller_init(struct naut_info* naut) {
+  ahci_controller_state_t *s = NULL;
   struct pci_info *pci = naut->sys.pci;
   struct list_head *curbus, *curdev;
   uint32_t num = 0;
 
   if (!pci) {
     ERROR("no PCI info\n");
-    return -1;
+    return NULL;
   }
 
   DEBUG("finding ahci controller\n");
@@ -399,22 +442,34 @@ static int controller_init(struct naut_info* naut) {
           
         if (cfg->hdr_type != 0x0) {
           ERROR("unexpected device type\n");
-          return -1;
+          return NULL;
         }
 
-        controller.abar = (hba_reg_t *)pci_dev_get_bar_addr(pdev, 5);
+        s = malloc(sizeof(ahci_controller_state_t));
+        if (!s) {
+          ERROR("could not allocate controller state\n");
+          return NULL;
+        }
+
+        s->abar = (hba_reg_t *)pci_dev_get_bar_addr(pdev, 5);
+
+        if (!s->abar->cap.s64a) {
+          // currently only support 64 bit addressing
+          ERROR("controller does not support 64 bit addressing\n");
+          return NULL;
+        }
       }
     }
   }
   
-  return 0;
+  return s;
 }
 
-static ahci_dev_t get_dev_type(hba_port_reg_t *port) {
-  if (port->ssts.det != HBA_PORT_DET_DETECTED) return AHCI_DEV_NULL;
-  if (port->ssts.ipm != HBA_PORT_IPM_ACTIVE)   return AHCI_DEV_NULL;
+static ahci_dev_t get_dev_type(hba_port_reg_t *regs) {
+  if (regs->ssts.det != HBA_PORT_DET_DETECTED) return AHCI_DEV_NULL;
+  if (regs->ssts.ipm != HBA_PORT_IPM_ACTIVE)   return AHCI_DEV_NULL;
 
-  switch (port->sig) {
+  switch (regs->sig) {
     case SATA_SIG_ATAPI: return AHCI_DEV_SATAPI;
     case SATA_SIG_SEMB:  return AHCI_DEV_SEMB;
     case SATA_SIG_PM:    return AHCI_DEV_PM;
@@ -422,7 +477,11 @@ static ahci_dev_t get_dev_type(hba_port_reg_t *port) {
   }
 }
 
-static int blkdev_identify(ahci_blkdev_state_t *s) {
+static int blkdev_identify(ahci_port_state_t *s) {
+  // currently only support SATA drives
+  if (s->type != AHCI_DEV_SATA) return 0;
+
+  
   // fis_h2d_t fis;
   // memset(&fis, 0, sizeof(fis_h2d_t));
   // fis.fis_type = FIS_TYPE_REG_H2D;
@@ -436,9 +495,13 @@ static int blkdev_identify(ahci_blkdev_state_t *s) {
   return 0;
 }
 
-static int blkdev_init(int portn) {
-  hba_port_reg_t *port = &controller.abar->ports[portn];
-  ahci_dev_t type = get_dev_type(port);
+static int port_irq_handler(ahci_port_state_t *s) {
+  return 0;
+}
+
+static int port_init(ahci_controller_state_t *controller, int portn) {
+  hba_port_reg_t *regs = &controller->abar->ports[portn];
+  ahci_dev_t type = get_dev_type(regs);
 
   if (type == AHCI_DEV_NULL) return 0;
 
@@ -446,54 +509,143 @@ static int blkdev_init(int portn) {
   sprintf(name, "ahci-%d-%d", portn, type);
   INFO("initializing block device: %s\n", name);
 
-  port->clb = malloc(32 * sizeof(cmd_hdr_t));
-  if (!port->clb) {
+  // allocate command list
+  uint8_t n_slots = controller->abar->cap.ncs;
+  regs->clb = malloc(n_slots * sizeof(cmd_hdr_t));
+  if (!regs->clb) {
     ERROR("could not allocate command list\n");
     return -1;
   }
-  memset(port->clb, 0, 32 * sizeof(cmd_hdr_t));
+  memset(regs->clb, 0, n_slots * sizeof(cmd_hdr_t));
 
-  port->fb = malloc(sizeof(fis_hba_t));
-  if (!port->fb) {
+  // allocate a command table in each header within the list 
+  for (int i = 0; i < n_slots; i++) {
+    regs->clb[i].ctba = malloc(sizeof(cmd_table_t));
+    if (!regs->clb[i].ctba) {
+      ERROR("could not allocate command table\n");
+      return -1;
+    }
+    memset(regs->clb[i].ctba, 0, sizeof(cmd_table_t));
+  }
+
+  // allocate device-to-host fis
+  regs->fb = malloc(sizeof(fis_hba_t));
+  if (!regs->fb) {
     ERROR("could not allocate frame information structure\n");
     return -1;
   }
 
-  ahci_blkdev_state_t *s = &(controller.devs[portn]);
+  // enable interrupts for device-to-host fis sending
+  regs->ie.dhre = 1;
 
+  // set up device state
+  ahci_port_state_t *s = &(controller->devs[portn]);
+
+  s->blkdev = nk_block_dev_register(name, 0, &interface, s);
   s->type = type;
   s->portn = portn;
-  s->controller = &controller;
-  s->blkdev = nk_block_dev_register(name, 0, &interface, s);
+  s->regs = regs;
+  s->controller = controller;
 
-  if (blkdev_identify(s)) {
-    ERROR("failed to identify device\n");
+  return 0;
+}
+
+static int claim_cmd_slot(ahci_port_state_t *s) {
+  uint32_t slots = s->regs->ci | s->regs->sact; 
+  for (int slot = 0; slot < s->controller->abar->cap.ncs; slot++) {
+    // find first slot with no command being issued
+    uint32_t mask = (1U << slot);
+    if (!(slots & mask)) {
+      // mark the command as issued and return the slot
+      s->regs->ci |= mask;
+      return slot;
+    }
+  }
+  
+  return -1;
+}
+
+// issue an ATA command
+// buf: buffer to store command result in
+// len: length of data buffer in bytes
+static int issue_cmd(ahci_port_state_t *s, fis_h2d_t *cmd, void *buf, size_t len) {
+  if (len > CMD_TBL_NUM_PRDT * (1LLU << 22)) {
+    // we can only store 4 MiB of data per prdt entry and currently only 1 prdt entry is used
+    ERROR("command result buffer length must be <= 4 MiB");
     return -1;
   }
 
-  return 0;
-}
-
-
-static int probe_ports() {
-  DEBUG("probing ahci ports\n");
-
-  uint32_t pi = controller.abar->pi;
-  for (int i = 0; i < HBA_MAX_PORTS; i++) {
-    if (pi & 1) { 
-      if (blkdev_init(i)) return -1;
-      pi >>= 1;
-    }
+  int slot = claim_cmd_slot(s);
+  if (slot == -1) {
+    ERROR("could not find unclaimed slot for new command\n");
+    return -1;
   }
+  cmd_hdr_t *cl_entry = &s->regs->clb[slot];
+  // copy the command into the command table
+  memcpy(&cl_entry->ctba->cfis, cmd, sizeof(fis_h2d_t));
+
+  cl_entry->ctba->prdt_entry[0].dba = buf;
+  // this field is 0 indexed so we subtract 1
+  cl_entry->ctba->prdt_entry[0].dbc = len - 1;
+  // interrupt when command completes
+  cl_entry->ctba->prdt_entry[0].i = 1;
+
+  cl_entry->cfl = sizeof(cmd) / 4;
+  cl_entry->a = 0;
+  cl_entry->w = 0;
+  cl_entry->p = 0;
+  cl_entry->r = 0;
+  cl_entry->b = 0;
+  cl_entry->c = 1;
+  cl_entry->prdtl = CMD_TBL_NUM_PRDT;
+  cl_entry->prdbc = 0;
+
+  // issue the command
+  uint8_t flags = spin_lock_irq_save(&s->cmdlock);
+  s->regs->ci = (1 << slot);
+  spin_unlock_irq_restore(&s->cmdlock, flags);
 
   return 0;
 }
+
+static int ahci_irq_handler(excp_entry_t *excp, excp_vec_t vec, void *state) {
+  DEBUG("handling irq: vector 0x%x rip: 0x%p s: 0x%p\n", vec, excp->rip, state);
+
+  return 0;
+} 
+
 
 int nk_ahci_init(struct naut_info* naut) {
   INFO("init\n");
 
-  if (controller_init(naut)) return -1;
-  if (probe_ports())         return -1;
+  // allocate and initialize the ahci controller
+  ahci_controller_state_t *controller = controller_init(naut);
+  if (!controller) return -1;
+  
+  // probe all implemented ahci ports for devices
+  for (int i = 0; i < HBA_MAX_PORTS; i++) {
+    if ((controller->abar->pi & (1U << i)) && port_init(controller, i)) return -1;
+  }
+
+  // register controller's interupt handler
+  uint64_t ivec = 0;
+  if (idt_find_and_reserve_range(1, 1, &ivec)) {
+    ERROR("could not find interrupt vector for controller\n");
+    return -1;
+  }
+  if (register_int_handler(ivec, ahci_irq_handler, controller)) {
+    ERROR("could not register interrupt handler for controller\n");
+    return -1;
+  }
+
+  // identify the device
+  // if (blkdev_identify(s)) {
+  //   ERROR("failed to identify device\n");
+  //   return -1;
+  // }
+
+  // enable interrupts for dma
+  controller->abar->ghc.ie = 1;
 
   return 0;
 }
@@ -508,7 +660,7 @@ static int get_characteristics(void *state, struct nk_block_dev_characteristics 
 }
 
 static int read_blocks(void *state, uint64_t blocknum, uint64_t count, uint8_t *dest, void (*callback)(nk_block_dev_status_t, void *), void *context) {
-  ahci_blkdev_state_t *s = (ahci_blkdev_state_t *)state;
+  ahci_port_state_t *s = (ahci_port_state_t *)state;
   
   DEBUG("read_blocks on device %s starting at %lu for %lu blocks\n", s->blkdev->dev.name, blocknum, count);
 
