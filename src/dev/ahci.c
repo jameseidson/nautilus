@@ -1,5 +1,6 @@
 #include <nautilus/nautilus.h>
 #include <nautilus/cpu.h>
+#include <nautilus/dev.h>
 #include <nautilus/mm.h>
 #include <nautilus/irq.h>
 #include <nautilus/naut_string.h>
@@ -325,8 +326,36 @@ typedef volatile struct {
         uint8_t cpde   : 1;  // cold presence detect enable
       } __attribute__((packed));
     } ie;		                   // 0x14, interrupt enable
-
-    uint32_t cmd;		           // 0x18, command and status
+    
+    union {
+      uint32_t val;
+      struct {
+        uint8_t st    : 1;  // start
+        uint8_t sud   : 1;  // spin-up device
+        uint8_t pod   : 1;  // power on device
+        uint8_t clo   : 1;  // command list override
+        uint8_t fre   : 1;  // fis receive enable
+        uint8_t rsvd  : 3;  // reserved
+        uint8_t ccs   : 5;  // current command slot
+        uint8_t mpss  : 1;  // mechanical presence switch state
+        uint8_t fr    : 1;  // fis receive running
+        uint8_t cr    : 1;  // command list running
+        uint8_t cps   : 1;  // cold presence state
+        uint8_t pma   : 1;  // port multiplier attached
+        uint8_t hpcp  : 1;  // hot plug capable port
+        uint8_t mpsp  : 1;  // mechanical presence switch attached to port
+        uint8_t cpd   : 1;  // cold presence detection
+        uint8_t esp   : 1;  // external sata port
+        uint8_t fbscp : 1;  // fis-based switching capable port
+        uint8_t apste : 1;  // automatic partial to slumber transitions enabled
+        uint8_t atapi : 1;  // device is atapi
+        uint8_t dlae  : 1;  // drive led on atapi enable
+        uint8_t alpe  : 1;  // aggressive link power management enable
+        uint8_t asp   : 1;  // aggressive slumber/partial 
+        uint8_t icc   : 4;  // interface communication control 
+      } __attribute__((packed));
+    } cmd;		    // 0x18, command and status
+    
     uint32_t rsv0;		         // 0x1C, Reserved
     uint32_t tfd;		           // 0x20, task file data
     uint32_t sig;		           // 0x24, signature
@@ -339,6 +368,7 @@ typedef volatile struct {
         uint32_t rsv : 20;
       } __attribute__((packed));
     } ssts;                    // 0x28, SATA status (SCR0:SStatus)
+
     uint32_t sctl;		         // 0x2C, SATA control (SCR2:SControl)
     uint32_t serr;		         // 0x30, SATA error (SCR1:SError)
     uint32_t sact;		         // 0x34, SATA active (SCR3:SActive)
@@ -460,15 +490,14 @@ typedef struct ahci_controller_state {
 
 // FUNCTION DEFINITIONS
 
-static ahci_controller_state_t *controller_init(struct naut_info* naut) {
-  ahci_controller_state_t *s = NULL;
+static int controller_init(struct naut_info* naut, ahci_controller_state_t *s) {
   struct pci_info *pci = naut->sys.pci;
   struct list_head *curbus, *curdev;
   uint32_t num = 0;
 
   if (!pci) {
     ERROR("no PCI info\n");
-    return NULL;
+    return -1;
   }
 
   DEBUG("finding ahci controller\n");
@@ -489,13 +518,7 @@ static ahci_controller_state_t *controller_init(struct naut_info* naut) {
           
         if (cfg->hdr_type != 0x0) {
           ERROR("unexpected device type\n");
-          return NULL;
-        }
-
-        s = malloc(sizeof(ahci_controller_state_t));
-        if (!s) {
-          ERROR("could not allocate controller state\n");
-          return NULL;
+          return -1;
         }
 
         s->abar = (hba_reg_t *)pci_dev_get_bar_addr(pdev, 5);
@@ -503,13 +526,13 @@ static ahci_controller_state_t *controller_init(struct naut_info* naut) {
         if (!s->abar->cap.s64a) {
           // currently only support 64 bit addressing
           ERROR("controller does not support 64 bit addressing\n");
-          return NULL;
+          return -1;
         }
       }
     }
   }
   
-  return s;
+  return 0;
 }
 
 static int get_completed_cmd(ahci_port_state_t *s) {
@@ -600,7 +623,8 @@ static int port_init(ahci_controller_state_t *controller, int portn) {
   hba_port_reg_t *regs = &controller->abar->ports[portn];
   ahci_dev_t type = get_dev_type(regs);
 
-  if (type == AHCI_DEV_NULL) return 0;
+  // currently only support SATA devices
+  if (type != AHCI_DEV_SATA) return 0;
 
   char name[32];
   sprintf(name, "ahci-%d-%d", portn, type);
@@ -640,12 +664,16 @@ static int port_init(ahci_controller_state_t *controller, int portn) {
 
   // set up device state
   ahci_port_state_t *s = &(controller->devs[portn]);
-
   s->blkdev = nk_block_dev_register(name, 0, &interface, s);
   s->type = type;
   s->portn = portn;
   s->regs = regs;
   s->controller = controller;
+
+  // start command processing
+  INFO("port %d: start command processing\n", s->portn);
+  s->regs->cmd.st = 1;
+  s->regs->cmd.fre = 1;
 
   return 0;
 }
@@ -680,7 +708,8 @@ static int port_issue_cmd(ahci_port_state_t *s, fis_h2d_t *cmd, void *buf, size_
     ERROR("could not find unclaimed slot for new command\n");
     return -1;
   }
-  DEBUG("issuing command at port %d in slot %d\n", s->portn, slot);
+
+  DEBUG("port %d: issuing command in slot %d\n", s->portn, slot);
 
   cmd_hdr_t *cl_entry = &s->regs->clb[slot];
   // copy the command into the command table
@@ -710,7 +739,6 @@ static int port_issue_cmd(ahci_port_state_t *s, fis_h2d_t *cmd, void *buf, size_
   s->cmd_state[slot].context = cb_context;
   spin_unlock_irq_restore(&s->cmdlock, flags);
 
-  DEBUG("command issued successfully\n");
   return 0;
 }
 
@@ -737,25 +765,54 @@ void identify_callback(nk_block_dev_status_t status, void *context) {
   DEBUG("WE CALLED THE CALLBACK AND OUR TC IS %d\n", fis->tc);
 }
 
-static int blkdev_identify(ahci_port_state_t *s) {
-  switch (s->type) {
-    case AHCI_DEV_SATA: {
-      DEBUG("identifying sata device on port %d\n", s->portn);
-      fis_h2d_t cmd;
-      memset(&cmd, 0, sizeof(fis_h2d_t));
-      cmd.fis_type = FIS_TYPE_REG_H2D;
-      cmd.command = ATA_CMD_IDENTIFY_DMA;
-      cmd.device = 0;
-      cmd.c = 1;
+static int port_ident_sata(ahci_port_state_t *s) {
+  DEBUG("port %d: identifying sata device\n", s->portn);
 
-      port_issue_cmd(s, &cmd, NULL, 0, identify_callback, s);
-      break;
-    } default: {
-      return 0;
+  fis_h2d_t fis;
+  memset(&fis, 0, sizeof(fis_h2d_t));
+  fis.fis_type = FIS_TYPE_REG_H2D;
+  fis.command = ATA_CMD_IDENTIFY_DMA;
+  fis.device = 0;
+  fis.c = 1;
+
+  port_issue_cmd(s, &fis, NULL, 0, identify_callback, s);
+
+  return 0;
+}
+
+static int finished_reset(void *state) {
+  ahci_controller_state_t *controller = state;
+
+  return !controller->abar->ghc.hr;
+}
+
+static int probe_ports(ahci_controller_state_t *controller) {
+  uint32_t pi = controller->abar->pi;
+  DEBUG("probing ports for devices, implemented mask: %x\n", pi);
+
+  for (int i = 0; pi & (i < HBA_MAX_PORTS); i++) {
+    if (pi & 1) {
+      if (port_init(controller, i)) {
+        ERROR("failed to initialize device at port %d\n", i);
+        return -1;
+      }
+
+      ahci_port_state_t *dev = &controller->devs[i];
+      switch(dev->type) {
+        case AHCI_DEV_SATA: {
+          if (port_ident_sata(dev)) {
+            ERROR("failed to identify sata device at port %d\n", i);
+            return -1;
+          }
+          break;
+        } default: {
+          break;
+        }
+      }
     }
+
+    pi >>= 1;
   }
-
-
 
   return 0;
 }
@@ -764,11 +821,20 @@ int nk_ahci_init(struct naut_info* naut) {
   INFO("init\n");
 
   // allocate and initialize the ahci controller
-  ahci_controller_state_t *controller = controller_init(naut);
+  ahci_controller_state_t *controller = malloc(sizeof(ahci_controller_state_t));
   if (!controller) {
+    ERROR("could not allocate controller\n");
+    return -1;
+  }
+  memset(controller, 0, sizeof(ahci_controller_state_t));
+
+  if (controller_init(naut, controller)) {
     INFO("could not find an ahci controller\n");
     return -1;
   }
+
+  // reset controller
+  // controller->abar->ghc.hr = 1;
 
   // register controller's interrupt handler
   uint64_t ivec = 0;
@@ -781,24 +847,10 @@ int nk_ahci_init(struct naut_info* naut) {
     return -1;
   }
   controller->abar->ghc.ie = 1;
-  
-  // probe all implemented ahci ports for devices
-  for (int i = 0; i < HBA_MAX_PORTS; i++) {
-    if (controller->abar->pi & (1U << i)) {
-      if (port_init(controller, i)) {
-        ERROR("could not initialize device at port %d\n", i);
-        return -1;
-      }
-    }
-  }
 
-  // identify the devices we found
-  for (int i = 0; i < HBA_MAX_PORTS; i++) {
-    ahci_port_state_t *dev = &controller->devs[i];
-    if (controller->abar->pi & (1U << i) && blkdev_identify(dev)) {
-      ERROR("failed to identify device at port %d\n", i);
-      return -1;
-    }
+  // probe implemented ports for devices and initialize/identify any we find 
+  if (probe_ports(controller)) {
+    ERROR("could not probe ports\n");
   }
 
   return 0;
