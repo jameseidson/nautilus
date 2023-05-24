@@ -1,5 +1,6 @@
 #include <nautilus/nautilus.h>
 #include <nautilus/cpu.h>
+#include <nautilus/timer.h>
 #include <nautilus/dev.h>
 #include <nautilus/mm.h>
 #include <nautilus/irq.h>
@@ -17,6 +18,12 @@
 #define ERROR(fmt, args...) ERROR_PRINT("ahci: " fmt, ##args)
 #define DEBUG(fmt, args...) DEBUG_PRINT("ahci: " fmt, ##args)
 #define INFO(fmt, args...) INFO_PRINT("ahci: " fmt, ##args)
+
+// atomic load from pointer with sequential consistency
+#define atomic_load(srcptr)         __atomic_load_n(srcptr,__ATOMIC_SEQ_CST)
+
+// atomic store to pointer with sequenial consistency
+#define atomic_store(destptr,value) __atomic_store_n(destptr,value,__ATOMIC_SEQ_CST)
 
 // AHCI Controller
 #define INTEL_VENDOR_ID     0x8086  // intel
@@ -71,12 +78,16 @@ typedef struct {
   uint8_t featurel;	// Feature register, 7:0
  
   // DWORD 1
-  uint8_t lba0[3];  // LBA low 7:0, mid 15:8, high 23:16
-  uint8_t device;		// Device register
+	uint8_t lba0;	 	  // LBA low register, 7:0
+	uint8_t lba1;	 	  // LBA mid register, 15:8
+	uint8_t lba2;	 	  // LBA high register, 23:16
+	uint8_t device;   // Device register
  
   // DWORD 2
-  uint8_t lba1[3];  // LBA low 31:24, LBA mid 39:32, LBA high47:40
-  uint8_t featureh;	// Feature register, 15:8
+	uint8_t lba3;		  // LBA register, 31:24
+	uint8_t lba4;		  // LBA register, 39:32
+	uint8_t lba5;		  // LBA register, 47:40
+	uint8_t featureh; // Feature register, 15:8
  
   // DWORD 3
   uint8_t countl;		// Count register, 7:0
@@ -113,12 +124,16 @@ typedef volatile struct {
   uint8_t error;       // Error register
  
   // DWORD 1
-  uint8_t lba0[3];     // LBA low 7:0, mid 15:8, high 23:16
-  uint8_t device;      // Device register
+	uint8_t lba0;        // LBA low register, 7:0
+	uint8_t lba1;        // LBA mid register, 15:8
+	uint8_t lba2;        // LBA high register, 23:16
+	uint8_t device;      // Device register
  
   // DWORD 2
-  uint8_t lba1[3];     // LBA low 31:24, LBA mid 39:32, LBA high47:40
-  uint8_t rsv2;        // Reserved
+	uint8_t lba3;        // LBA register, 31:24
+	uint8_t lba4;        // LBA register, 39:32
+	uint8_t lba5;        // LBA register, 47:40
+	uint8_t rsv2;        // Reserved
  
   // DWORD 3
   uint8_t countl;      // Count register, 7:0
@@ -128,6 +143,43 @@ typedef volatile struct {
   // DWORD 4
   uint8_t  rsv4[4];     // Reserved
 } __attribute__((packed)) fis_d2h_t;
+
+
+typedef volatile struct {
+	// DWORD 0
+	uint8_t  fis_type;	// FIS_TYPE_PIO_SETUP
+ 
+	uint8_t  pmport:4;	// Port multiplier
+	uint8_t  rsv0:1;		// Reserved
+	uint8_t  d:1;		// Data transfer direction, 1 - device to host
+	uint8_t  i:1;		// Interrupt bit
+	uint8_t  rsv1:1;
+ 
+	uint8_t  status;		// Status register
+	uint8_t  error;		// Error register
+ 
+	// DWORD 1
+	uint8_t  lba0;		// LBA low register, 7:0
+	uint8_t  lba1;		// LBA mid register, 15:8
+	uint8_t  lba2;		// LBA high register, 23:16
+	uint8_t  device;		// Device register
+ 
+	// DWORD 2
+	uint8_t  lba3;		// LBA register, 31:24
+	uint8_t  lba4;		// LBA register, 39:32
+	uint8_t  lba5;		// LBA register, 47:40
+	uint8_t  rsv2;		// Reserved
+ 
+	// DWORD 3
+	uint8_t  countl;		// Count register, 7:0
+	uint8_t  counth;		// Count register, 15:8
+	uint8_t  rsv3;		// Reserved
+	uint8_t  e_status;	// New value of status register
+ 
+	// DWORD 4
+	uint16_t tc;		// Transfer count
+	uint8_t  rsv4[2];	// Reserved
+} __attribute__((packed)) fis_pio_setup_t;;
 
 typedef volatile struct {
   // DWORD 0
@@ -177,7 +229,7 @@ typedef volatile struct{
   uint8_t pad0[4];
  
   // 0x20
-  uint8_t psfis[20];     // PIO setup FIS (unused since we are using DMA)
+  fis_pio_setup_t psfis; // PIO setup FIS
   uint8_t pad1[12];
  
   // 0x40
@@ -198,6 +250,7 @@ typedef volatile struct{
 
 typedef enum {
   ATA_CMD_IDENTIFY_DMA = 0xEE,
+  ATA_CMD_IDENTIFY_PIO = 0xEC,
 } ata_cmd_t;
 
 typedef struct {
@@ -208,7 +261,7 @@ typedef struct {
   uint8_t acmd[16];    // ATAPI command
   
   // 0x50
-  uint8_t  rsv[48];	   // Reserved
+  uint8_t rsv[48];	   // Reserved
 
   // 0x80
   struct {
@@ -226,6 +279,14 @@ typedef struct {
     uint32_t i:1;		   // Interrupt on completion
   } __attribute__((packed)) prdt_entry[CMD_TBL_NUM_PRDT];  // Physical region descriptor table entries, 0 ~ 65535
 } __attribute__((packed)) cmd_table_t;
+
+
+// #define CMDHDR_CLR_BUSY = (1 << 10)
+// #define CMDHDR_BIST = (1 << 9)
+// #define CMDHDR_RESET (1 << 8)
+// #define CMDHDR_PREFETCH = (1 << 7)
+// #define CMDHDR_WRITE = (1 << 6)
+// #define CMDHDR_ATAPI = (1 << 5)
 
 typedef struct {
   // DW0
@@ -260,6 +321,26 @@ typedef struct {
 
 // AHCI REGISTER DECLARATIONS
 
+#define PORT_CMD_RUNNING (1 << 15)
+#define PORT_CMD_FIS (1 << 4)
+#define PORT_CMD_START 1
+
+#define PORT_IS_TF_ERR    (1 << 30)
+#define PORT_IS_PRD       (1 << 5)
+#define PORT_IS_DMA_SETUP (1 << 2)
+#define PORT_IS_PIO_SETUP (1 << 1)
+#define PORT_IS_D2H        1
+
+#define PORT_IE_TF_ERR (1 << 30)
+#define PORT_IE_OVERFLOW (1 << 24)
+#define PORT_IE_PRD_PROCESSED (1 << 5)
+#define PORT_IE_DMA_SETUP (1 << 2)
+#define PORT_IE_PIO_SETUP (1 << 1)
+#define PORT_IE_D2H 1
+
+#define PORT_TFD_BUSY 0x80
+#define PORT_TFD_DATA_REQ 0x08
+
 typedef volatile struct {
     union {
       cmd_hdr_t *clb;
@@ -277,55 +358,8 @@ typedef volatile struct {
       } __attribute__((packed));
     };                         // fis base address 
 
-    union {
-      uint32_t val;
-      struct {
-        uint8_t dhrs   : 1;  // device to host register fis interrupt
-        uint8_t pss    : 1;  // pio setup fis interrupt
-        uint8_t dss    : 1;  // dma setup fis interrupt
-        uint8_t sdbs   : 1;  // set device bits interrupt
-        uint8_t ufs    : 1;  // unknown fis interrupt
-        uint8_t dps    : 1;  // descriptor processed
-        uint8_t pcs    : 1;  // port connect change status
-        uint8_t dmps   : 1;  // device mechanical presence status
-        uint16_t rsvd0 : 14; // reserved
-        uint8_t prcs   : 1;  // phyrdy change status
-        uint8_t ipms   : 1;  // incorrect port multiplier status
-        uint8_t ofs    : 1;  // overflow status
-        uint8_t rsvd1  : 1;  // reserved
-        uint8_t infs   : 1;  // interface non-fatal error status
-        uint8_t ifs    : 1;  // interface fatal error status
-        uint8_t hbds   : 1;  // host bus data error status
-        uint8_t hbfs   : 1;  // host bus fatal error status
-        uint8_t tfes   : 1;  // task file error status
-        uint8_t cpds   : 1;  // cold port detection status
-      } __attribute__((packed));
-    } is;		    // 0x10, interrupt status
-
-    union {
-      uint32_t val;
-      struct {
-        uint8_t dhre   : 1;  // device to host register fis interrupt enable
-        uint8_t pse    : 1;  // pio setup fis interrupt enable
-        uint8_t dse    : 1;  // dma setup fis interrupt enable
-        uint8_t sdbe   : 1;  // set device bits fis interrupt enable
-        uint8_t ufe    : 1;  // unknown fis interrupt enable
-        uint8_t dpe    : 1;  // descriptor processed interrupt enable
-        uint8_t pce    : 1;  // port change interrupt enable
-        uint8_t dmpe   : 1;  // device mechanical presence enable
-        uint16_t rsv0  : 14; // reserved
-        uint8_t prce   : 1;  // phyrdy change interrupt enable
-        uint8_t ipme   : 1;  // incorrect port multiplier enable
-        uint8_t ofe    : 1;  // overflow enable
-        uint8_t rsv1   : 1;  // reserved
-        uint8_t infe   : 1;  // interface non-fatal error enable
-        uint8_t ife    : 1;  // interface fatal error enable
-        uint8_t hbde   : 1;  // host bus data error enable
-        uint8_t hbfe   : 1;  // host bus fatal error enable
-        uint8_t tfee   : 1;  // task file error enable
-        uint8_t cpde   : 1;  // cold presence detect enable
-      } __attribute__((packed));
-    } ie;		                   // 0x14, interrupt enable
+    volatile uint32_t is;               // 0x10, interrupt status  
+    uint32_t ie;               // 0x14, interrupt enable
     
     union {
       uint32_t val;
@@ -359,17 +393,27 @@ typedef volatile struct {
     uint32_t rsv0;		         // 0x1C, Reserved
     uint32_t tfd;		           // 0x20, task file data
     uint32_t sig;		           // 0x24, signature
+    
     union {
       uint32_t val;
-      volatile struct {
+      struct {
         uint8_t det   : 4;    // Device detection
         uint8_t spd   : 4;    // Current interface speed
         uint8_t ipm   : 4;    // Interface power management
-        uint32_t rsv : 20;
+        uint32_t rsv  : 20;
       } __attribute__((packed));
     } ssts;                    // 0x28, SATA status (SCR0:SStatus)
 
-    uint32_t sctl;		         // 0x2C, SATA control (SCR2:SControl)
+    union {
+      uint32_t val;
+      struct {
+        uint8_t det  : 4;   // device detection
+        uint8_t spd  : 4;   // speed allowed
+        uint8_t ipm  : 4;   // power management transitions allowed
+        uint32_t rsv : 20;
+      } __attribute__((packed));
+    } sctl;                    // 0x2C, SATA control (SCR2:SControl)
+
     uint32_t serr;		         // 0x30, SATA error (SCR1:SError)
     uint32_t sact;		         // 0x34, SATA active (SCR3:SActive)
     uint32_t ci;		           // 0x38, command issue
@@ -379,11 +423,15 @@ typedef volatile struct {
     uint32_t vendor[4];	       // 0x70 ~ 0x7F, vendor specific
 } __attribute__((packed)) hba_port_reg_t;
 
+#define HBA_GHC_RESET        1
+#define HBA_GHC_IRQ_ENABLE  (1 << 1)
+#define HBA_GHC_AHCI_ENABLE (1 << 31)
+
 typedef volatile struct {
   // 0x00 - 0x2B, Generic Host Control
   union {
     uint32_t val;
-    volatile struct {
+    struct {
       uint8_t np    : 5;  // number of ports 
       uint8_t sxs   : 1;  // supports external SATA
       uint8_t ems   : 1;  // enclosure management supported
@@ -408,17 +456,7 @@ typedef volatile struct {
     } __attribute__((packed));
   } cap;                       // 0x00, Host Capability
 
-  union {
-    uint32_t val;
-    struct {
-      uint8_t  hr   : 1;  // hba reset
-      uint8_t  ie   : 1;  // interrupt enable
-      uint8_t  mrsm : 1;  // msi revert to single message
-      uint32_t rsvd : 28; // reserved
-      uint8_t  ae   : 1;  // ahci enable
-    } __attribute__((packed));
-  } ghc;            // 0x04, Global host control
-
+  uint32_t ghc;                // 0x04, Global host control
   uint32_t is;                 // 0x08, Interrupt status
   uint32_t pi;		             // 0x0C, Port implemented
   uint32_t vs;		             // 0x10, Version
@@ -482,7 +520,9 @@ typedef struct ahci_port_state {
 
 typedef struct ahci_controller_state {
   hba_reg_t *abar;  // ahci base address register
-  
+
+  struct pci_dev *pdev;
+
   struct ahci_port_state devs[HBA_MAX_PORTS];
 } ahci_controller_state_t;
 
@@ -513,7 +553,7 @@ static int controller_init(struct naut_info* naut, ahci_controller_state_t *s) {
       
       DEBUG("device %u is a 0x%x:0x%x\n", pdev->num, cfg->vendor_id, cfg->device_id);
   
-      if (cfg->vendor_id  == INTEL_VENDOR_ID  && cfg->device_id == ICH9_DEVICE_ID) {
+      if (cfg->vendor_id == INTEL_VENDOR_ID && cfg->device_id == ICH9_DEVICE_ID) {
         DEBUG("found an ahci controller\n");
           
         if (cfg->hdr_type != 0x0) {
@@ -522,12 +562,14 @@ static int controller_init(struct naut_info* naut, ahci_controller_state_t *s) {
         }
 
         s->abar = (hba_reg_t *)pci_dev_get_bar_addr(pdev, 5);
+        s->pdev = pdev;
 
-        if (!s->abar->cap.s64a) {
-          // currently only support 64 bit addressing
-          ERROR("controller does not support 64 bit addressing\n");
-          return -1;
-        }
+        // allow device to use DMA
+        uint16_t cmdreg = pci_cfg_readw(bus->num, pdev->num, 0, 0x4);
+        cmdreg |= 0x7; // make sure bus master is enabled
+        pci_cfg_writew(bus->num, pdev->num, 0, 0x4, cmdreg);
+
+        uint16_t stat = pci_cfg_readw(bus->num, pdev->num, 0, 0x6);
       }
     }
   }
@@ -540,7 +582,8 @@ static int get_completed_cmd(ahci_port_state_t *s) {
 
   int slot;
   for (slot = 0; slot < CMD_LIST_SIZE; slot++) {
-    if (s->cmd_state[slot].running && !(ci & 1U)) return slot; 
+    // DEBUG("command list %d is running?: %d\n", slot, s->cmd_state[slot].running);
+    if (s->cmd_state[slot].running && !(ci & 1)) return slot; 
     ci >>= 1;
   }
 
@@ -548,30 +591,34 @@ static int get_completed_cmd(ahci_port_state_t *s) {
 }
 
 static int port_handle_irq(ahci_port_state_t *s) {
-  DEBUG("irq routed to port %d\n", s->portn);
-  
+
+  uint32_t is = s->regs->is;
+  s->regs->is = is;
+
   // check for task file errors
-  if (s->regs->is.tfes) {
+  if (is & PORT_IS_TF_ERR) {
     ERROR("task file error\n");
     return -1;
   }
 
   // prdt finished processing
-  if (s->regs->is.dps) {
+  if (is & PORT_IS_PRD) {
     DEBUG("finished transferring prdt to controller\n");
     return 0;
   }
 
   int slot = get_completed_cmd(s);
   if (slot == -1) {
-      INFO("no commands have been completed so this interrupt is unexpected, ignoring\n");
+      DEBUG("no commands have been completed so this interrupt is unexpected, ignoring\n");
   } 
 
-  // DMA setup interrupt 
-  else if (s->regs->is.dss) {
+  // PIO setup interrupt 
+  else if (is & PORT_IS_PIO_SETUP) {
+    DEBUG("interrupt was for a PIO setup command\n");
     uint8_t flags = spin_lock_irq_save(&s->cmdlock);
     s->cmd_state[slot].running = 0;
     spin_unlock_irq_restore(&s->cmdlock, flags);
+    DEBUG("slot: %d\n", slot);
 
     if (s->cmd_state[slot].callback) {
       s->cmd_state[slot].callback(NK_BLOCK_DEV_STATUS_SUCCESS, s->cmd_state[slot].context);
@@ -580,7 +627,8 @@ static int port_handle_irq(ahci_port_state_t *s) {
   }
 
   // device register update
-  else if (s->regs->is.dhrs) {
+  else if (is & PORT_IS_D2H) {
+    DEBUG("interrupt was for a d2h command\n");
     // mark the command as no longer running
     uint8_t flags = spin_lock_irq_save(&s->cmdlock);
     s->cmd_state[slot].running = 0;
@@ -619,12 +667,293 @@ static ahci_dev_t get_dev_type(hba_port_reg_t *regs) {
   }
 }
 
+static int find_cmd_slot(ahci_port_state_t *s) {
+  uint32_t slots = s->regs->ci | s->regs->sact;
+  for (int slot = 0; slot < s->controller->abar->cap.ncs; slot++) {
+    if ((slots & 1) == 0) {
+      return slot;
+    }
+    slots >>= 1;
+  }
+
+  return -1;
+}
+
+
+// issue an ATA command
+// buf: data buffer
+// len: length of data buffer in bytes
+static int port_issue_cmd(ahci_port_state_t *s, fis_h2d_t *cmd, void *buf, size_t len, cmd_callback_t callback, void *cb_context) {
+  if (len > CMD_TBL_NUM_PRDT * (1LLU << 22)) {
+    // we can only store 4 MiB of data per prdt entry and currently only 1 prdt entry is used
+    ERROR("command result buffer length must be <= 4 MiB");
+    return -1;
+  }
+
+  int slot = find_cmd_slot(s);
+  if (slot == -1) {
+    ERROR("could not find unclaimed slot for new command\n");
+    return -1;
+  }
+
+  DEBUG("port %d: issuing command in slot %d\n", s->portn, slot);
+
+  cmd_hdr_t *cl_entry = &s->regs->clb[slot];
+  // copy the command into the command table
+  memcpy(&cl_entry->ctba->cfis, cmd, sizeof(fis_h2d_t));
+
+  cl_entry->ctba->prdt_entry[0].dba = buf;
+  // this field is 0 indexed so we subtract 1
+  cl_entry->ctba->prdt_entry[0].dbc = len == 0 ? len - 1 : 0;
+  // interrupt when command completes
+  cl_entry->ctba->prdt_entry[0].i = 1;
+
+  cl_entry->cfl = sizeof(cmd) / 4;
+  cl_entry->a = 0;
+  cl_entry->w = 0;
+  cl_entry->p = 0;
+  cl_entry->r = 0;
+  cl_entry->b = 0;
+  cl_entry->c = 1;
+  cl_entry->prdtl = CMD_TBL_NUM_PRDT;
+  cl_entry->prdbc = 0;
+
+  // issue the command and save state for when it finishes
+  uint8_t flags = spin_lock_irq_save(&s->cmdlock);
+  s->cmd_state[slot].running = 1;
+  s->cmd_state[slot].callback = callback;
+  s->cmd_state[slot].context = cb_context;
+  s->regs->ci |= (1U << slot);
+  spin_unlock_irq_restore(&s->cmdlock, flags);
+
+  // while (1) {
+  //   uint16_t stat = pci_dev_cfg_readw(s->controller->pdev, 0x6);
+  //   DEBUG("PCI status: 0x%04x\n", stat);
+  //   DEBUG("GHC interrupt status: %x\n", s->controller->abar->is);
+  //   DEBUG("Port interrupt status: %x\n", s->regs->is.val);
+  //   DEBUG("GHC interrupt status: %x\n", atomic_load(&s->controller->abar->is));
+  //   DEBUG("Port interrupt status: %x\n", atomic_load(&s->regs->is.val));
+  // }
+
+  return 0;
+}
+
+static int ahci_irq_handler(excp_entry_t *excp, excp_vec_t vec, void *state) {
+  ahci_controller_state_t *s = state;
+
+  DEBUG("handling irq: vector 0x%x rip: 0x%p s: 0x%p\n", vec, excp->rip, state);
+  DEBUG("controller interrupt status: %x\n", s->abar->is);
+
+  uint32_t is = s->abar->is;
+
+  for (int i = 0; i < HBA_MAX_PORTS; i++) {
+    uint32_t mask = 1 << i;
+    if (is & mask) {
+      DEBUG("port %d: interrupt status: %x\n", i, s->devs[i].regs->is);
+
+      if (port_handle_irq(&s->devs[i])) {
+        return -1;
+      }
+    }
+  }
+
+  s->abar->is = is;
+  IRQ_HANDLER_END();
+  return 0;
+} 
+
+void identify_callback(nk_block_dev_status_t status, void *context) {
+  ahci_port_state_t *s = context;
+  fis_pio_setup_t *fis = &s->regs->fb->psfis;
+
+  DEBUG("WE CALLED THE CALLBACK AND OUR TC IS %d\n", fis->tc);
+
+  uint16_t *buf = s->regs->clb[0].ctba->prdt_entry[0].dba;
+
+  // for (int i = 0; i < 256; i++) {
+  //   DEBUG("field %d: %x\n", i, buf[i]);
+  // }
+}
+
+static int port_identify(ahci_port_state_t *s) {
+  DEBUG("port %d: identifying sata device\n", s->portn);
+
+  uint16_t *buf = malloc(256 * sizeof(uint16_t));
+  memset(buf, 0, 256 * sizeof(uint16_t));
+
+  s->regs->is = -1;
+
+  uint8_t flags = spin_lock_irq_save(&s->cmdlock);
+  
+  int slot = find_cmd_slot(s);
+  if (slot == -1) {
+    ERROR("could not claim command slot\n");
+  }
+
+  cmd_hdr_t *cmdhdr = &s->regs->clb[slot];
+  cmdhdr->cfl = sizeof(fis_h2d_t) / sizeof(uint32_t);
+  cmdhdr->w = 0;
+  cmdhdr->prdtl = 1;
+
+  cmd_table_t *cmdtbl = cmdhdr->ctba;
+  memset(cmdtbl, 0, sizeof(cmd_table_t));
+
+  cmdtbl->prdt_entry[0].dba = buf;
+  cmdtbl->prdt_entry[0].dbc = (256 * sizeof(uint16_t)) - 1;
+  cmdtbl->prdt_entry[0].i = 0;
+
+  fis_h2d_t *cmdfis = &cmdtbl->cfis;
+  memset(cmdfis, 0, sizeof(fis_h2d_t));
+  cmdfis->fis_type = FIS_TYPE_REG_H2D;
+  cmdfis->command = ATA_CMD_IDENTIFY_PIO;
+  cmdfis->c = 1;
+
+  size_t spin = 0;
+  while ((s->regs->tfd & (PORT_TFD_BUSY | PORT_TFD_DATA_REQ)) && spin < 1000000) {
+    spin++;
+  }
+  if (spin == 1000000) {
+    ERROR("port is hung\n");
+    return -1;
+  }
+
+  DEBUG("command list entry %d is now running\n", slot);
+  s->cmd_state[slot].running = 1;
+  s->cmd_state[slot].callback = identify_callback;
+  s->cmd_state[slot].context = s;
+
+  s->regs->ci |= (1 << slot);
+
+  spin_unlock_irq_restore(&s->cmdlock, flags);
+
+  return 0;
+}
+
+static int port_identify_blocking(ahci_port_state_t *s) {
+  // currently only support SATA devices
+
+  DEBUG("port %d: identifying sata device\n", s->portn);
+
+  uint16_t *buf = malloc(256 * sizeof(uint16_t));
+  memset(buf, 0, 256 * sizeof(uint16_t));
+
+  s->regs->is = -1;
+
+  uint8_t flags = spin_lock_irq_save(&s->cmdlock);
+  
+  int slot = find_cmd_slot(s);
+  if (slot == -1) {
+    ERROR("could not claim command slot\n");
+  }
+
+  cmd_hdr_t *cmdhdr = &s->regs->clb[slot];
+  cmdhdr->cfl = sizeof(fis_h2d_t) / sizeof(uint32_t);
+  cmdhdr->w = 0;
+  cmdhdr->prdtl = 1;
+
+  cmd_table_t *cmdtbl = cmdhdr->ctba;
+  memset(cmdtbl, 0, sizeof(cmd_table_t));
+
+  cmdtbl->prdt_entry[0].dba = buf;
+  cmdtbl->prdt_entry[0].dbc = (256 * sizeof(uint16_t)) - 1;
+  cmdtbl->prdt_entry[0].i = 0;
+
+  fis_h2d_t *cmdfis = &cmdtbl->cfis;
+  memset(cmdfis, 0, sizeof(fis_h2d_t));
+  cmdfis->fis_type = FIS_TYPE_REG_H2D;
+  cmdfis->command = ATA_CMD_IDENTIFY_PIO;
+  cmdfis->c = 1;
+
+  size_t spin = 0;
+  while ((s->regs->tfd & (PORT_TFD_BUSY | PORT_TFD_DATA_REQ)) && spin < 1000000) {
+    spin++;
+  }
+  if (spin == 1000000) {
+    ERROR("port is hung\n");
+    return -1;
+  }
+
+  s->regs->ci = 1 << slot;
+
+  spin_unlock_irq_restore(&s->cmdlock, flags);
+
+  while (1) {
+    if ((s->regs->ci & (1 << slot)) == 0) break;
+
+    if (s->regs->is & PORT_IS_TF_ERR) {
+      ERROR("task file error\n");
+      return -1;
+    }
+  }
+
+  if (s->regs->is & PORT_IS_TF_ERR) {
+    ERROR("task file error\n");
+    return -1;
+  }
+
+  fis_pio_setup_t *rfis = &s->regs->fb->psfis;
+  
+  DEBUG("received FIS of type: %x\n", rfis->fis_type);
+  DEBUG("transfer count: %d\n", rfis->tc);
+
+  DEBUG("status register: %x\n", rfis->status);
+  DEBUG("error register: %x\n", rfis->error);
+
+  // nk_delay(1000000);
+
+  // for (int i = 0; i < 256; i++) {
+  //   DEBUG("field %d: %x\n", i, buf[i]);
+  // }
+
+  // if (!((buf[83] >> 10) & 0x1)) { 
+  //   ERROR("LBA48 not supported on this drive\n");
+  //   return -1;
+  // } else {
+  //   size_t num_blocks = 
+  //     (((uint64_t) buf[103]) << 48) +
+	//     (((uint64_t) buf[102]) << 32) +
+	//     (((uint64_t) buf[101]) << 16) +
+	//     (((uint64_t) buf[100]) <<  0) ;
+
+  //   DEBUG("LBA48 supported, block data is %x %x %x %x\n", buf[103], buf[102], buf[101], buf[100]);
+  //   DEBUG("Interpretted as numblocks=0x%x\n", num_blocks);
+  // }
+
+
+  return 0;
+}
+
+static void port_start_cmd(ahci_port_state_t *s) {
+  while (s->regs->cmd.val & PORT_CMD_RUNNING);
+
+  s->regs->cmd.val |= (PORT_CMD_START | PORT_CMD_FIS);
+}
+
+static void port_stop_cmd(ahci_port_state_t *s) {
+  s->regs->cmd.val &= ~(PORT_CMD_START | PORT_CMD_FIS);
+
+  while(s->regs->cmd.val & (PORT_CMD_START | PORT_CMD_FIS));
+}
+
+static void port_reset(ahci_port_state_t *s) {
+  s->regs->sctl.det = 0x1;
+
+  // sleep for 1 ms before clearing to ensure that device has time to read
+  nk_delay(1000000);
+  
+  s->regs->sctl.det = 0x0;
+
+  // wait for communication to be re-established
+  while (s->regs->ssts.det != 0x3);
+
+  s->regs->serr = -1;
+
+  DEBUG("successfully reset port %d\n", s->portn);
+}
+
 static int port_init(ahci_controller_state_t *controller, int portn) {
   hba_port_reg_t *regs = &controller->abar->ports[portn];
   ahci_dev_t type = get_dev_type(regs);
-
-  // currently only support SATA devices
-  if (type != AHCI_DEV_SATA) return 0;
 
   char name[32];
   sprintf(name, "ahci-%d-%d", portn, type);
@@ -646,6 +975,10 @@ static int port_init(ahci_controller_state_t *controller, int portn) {
       ERROR("could not allocate command table\n");
       return -1;
     }
+    if((uint64_t)regs->clb[i].ctba & 0b1111111) {
+      ERROR("command table was not 128 byte aligned\n");
+      return -1;
+    }
     memset(regs->clb[i].ctba, 0, sizeof(cmd_table_t));
   }
 
@@ -656,12 +989,6 @@ static int port_init(ahci_controller_state_t *controller, int portn) {
     return -1;
   }
 
-  // enable interrupts
-  regs->ie.dhre = 1;
-  regs->ie.dse = 1;
-  regs->ie.dpe = 1;
-  regs->ie.tfee = 1;
-
   // set up device state
   ahci_port_state_t *s = &(controller->devs[portn]);
   s->blkdev = nk_block_dev_register(name, 0, &interface, s);
@@ -670,142 +997,44 @@ static int port_init(ahci_controller_state_t *controller, int portn) {
   s->regs = regs;
   s->controller = controller;
 
-  // start command processing
-  INFO("port %d: start command processing\n", s->portn);
-  s->regs->cmd.st = 1;
-  s->regs->cmd.fre = 1;
-
   return 0;
 }
 
-static int claim_cmd_slot(ahci_port_state_t *s) {
-  uint32_t slots = s->regs->ci | s->regs->sact; 
-  for (int slot = 0; slot < s->controller->abar->cap.ncs; slot++) {
-    // find first slot with no command being issued
-    uint32_t mask = (1U << slot);
-    if (!(slots & mask)) {
-      // mark the command as issued and return the slot
-      s->regs->ci |= mask;
-      return slot;
-    }
-  }
-  
-  return -1;
-}
-
-// issue an ATA command
-// buf: buffer to store command result in
-// len: length of data buffer in bytes
-static int port_issue_cmd(ahci_port_state_t *s, fis_h2d_t *cmd, void *buf, size_t len, cmd_callback_t callback, void *cb_context) {
-  if (len > CMD_TBL_NUM_PRDT * (1LLU << 22)) {
-    // we can only store 4 MiB of data per prdt entry and currently only 1 prdt entry is used
-    ERROR("command result buffer length must be <= 4 MiB");
-    return -1;
-  }
-
-  int slot = claim_cmd_slot(s);
-  if (slot == -1) {
-    ERROR("could not find unclaimed slot for new command\n");
-    return -1;
-  }
-
-  DEBUG("port %d: issuing command in slot %d\n", s->portn, slot);
-
-  cmd_hdr_t *cl_entry = &s->regs->clb[slot];
-  // copy the command into the command table
-  memcpy(&cl_entry->ctba->cfis, cmd, sizeof(fis_h2d_t));
-
-  cl_entry->ctba->prdt_entry[0].dba = buf;
-  // this field is 0 indexed so we subtract 1
-  cl_entry->ctba->prdt_entry[0].dbc = len - 1;
-  // interrupt when command completes
-  cl_entry->ctba->prdt_entry[0].i = 1;
-
-  cl_entry->cfl = sizeof(cmd) / 4;
-  cl_entry->a = 0;
-  cl_entry->w = 0;
-  cl_entry->p = 0;
-  cl_entry->r = 0;
-  cl_entry->b = 0;
-  cl_entry->c = 1;
-  cl_entry->prdtl = CMD_TBL_NUM_PRDT;
-  cl_entry->prdbc = 0;
-
-  // issue the command and save state for when it finishes
-  uint8_t flags = spin_lock_irq_save(&s->cmdlock);
-  s->regs->ci &= (1U << slot);
-  s->cmd_state[slot].running = 1;
-  s->cmd_state[slot].callback = callback;
-  s->cmd_state[slot].context = cb_context;
-  spin_unlock_irq_restore(&s->cmdlock, flags);
-
-  return 0;
-}
-
-static int ahci_irq_handler(excp_entry_t *excp, excp_vec_t vec, void *state) {
-  DEBUG("handling irq: vector 0x%x rip: 0x%p s: 0x%p\n", vec, excp->rip, state);
-
-  ahci_controller_state_t *s = state;
-  
-  uint32_t irq_status = s->abar->is & s->abar->pi;
-  for (int i = 0; i < HBA_MAX_PORTS; i++) {
-    if (irq_status & 1) {
-      if (port_handle_irq(&s->devs[i])) return -1;
-    }
-    irq_status >>= 1;
-  }
-  
-  return 0;
-} 
-
-void identify_callback(nk_block_dev_status_t status, void *context) {
-  ahci_port_state_t *s = context;
-  fis_dma_setup_t *fis = &s->regs->fb->dsfis;
-
-  DEBUG("WE CALLED THE CALLBACK AND OUR TC IS %d\n", fis->tc);
-}
-
-static int port_ident_sata(ahci_port_state_t *s) {
-  DEBUG("port %d: identifying sata device\n", s->portn);
-
-  fis_h2d_t fis;
-  memset(&fis, 0, sizeof(fis_h2d_t));
-  fis.fis_type = FIS_TYPE_REG_H2D;
-  fis.command = ATA_CMD_IDENTIFY_DMA;
-  fis.device = 0;
-  fis.c = 1;
-
-  port_issue_cmd(s, &fis, NULL, 0, identify_callback, s);
-
-  return 0;
-}
-
-static int finished_reset(void *state) {
-  ahci_controller_state_t *controller = state;
-
-  return !controller->abar->ghc.hr;
-}
-
-static int probe_ports(ahci_controller_state_t *controller) {
+static int probe(ahci_controller_state_t *controller) {
   uint32_t pi = controller->abar->pi;
   DEBUG("probing ports for devices, implemented mask: %x\n", pi);
 
   for (int i = 0; pi & (i < HBA_MAX_PORTS); i++) {
-    if (pi & 1) {
-      if (port_init(controller, i)) {
-        ERROR("failed to initialize device at port %d\n", i);
-        return -1;
-      }
-
-      ahci_port_state_t *dev = &controller->devs[i];
-      switch(dev->type) {
+    // only support SATA devices
+    if ((pi & 1)) {
+      switch (get_dev_type(&controller->abar->ports[i])) {
         case AHCI_DEV_SATA: {
-          if (port_ident_sata(dev)) {
-            ERROR("failed to identify sata device at port %d\n", i);
+          if (port_init(controller, i)) {
+            ERROR("port %d: failed to initialize sata device\n", i);
             return -1;
           }
+          
+          ahci_port_state_t *dev = &controller->devs[i];
+          port_reset(dev);
+          port_start_cmd(dev);
+
+          // enable interrupts
+          // dev->regs->ie = (PORT_IE_D2H | PORT_IE_PIO_SETUP | PORT_IE_TF_ERR);
+          dev->regs->ie = -1;
+          
+          if (port_identify(dev)) {
+            ERROR("port %d: failed to identify sata device\n", i);
+            return -1;
+          }
+
+          // if (port_identify_blocking(dev)) {
+          //   ERROR("port %d: failed to identify sata device\n", i);
+          //   return -1;
+          // }
+
           break;
         } default: {
+          // only support SATA devices
           break;
         }
       }
@@ -814,6 +1043,7 @@ static int probe_ports(ahci_controller_state_t *controller) {
     pi >>= 1;
   }
 
+  DEBUG("finished probing\n");
   return 0;
 }
 
@@ -834,22 +1064,30 @@ int nk_ahci_init(struct naut_info* naut) {
   }
 
   // reset controller
-  // controller->abar->ghc.hr = 1;
+  INFO("resetting controller\n");
+  controller->abar->ghc |= HBA_GHC_RESET;
+  while (controller->abar->ghc & HBA_GHC_RESET);
 
   // register controller's interrupt handler
-  uint64_t ivec = 0;
-  if (idt_find_and_reserve_range(1, 1, &ivec)) {
-    ERROR("could not find interrupt vector for controller\n");
-    return -1;
-  }
-  if (register_int_handler(ivec, ahci_irq_handler, controller)) {
+  if (register_int_handler(0xe4, ahci_irq_handler, controller)) {
     ERROR("could not register interrupt handler for controller\n");
     return -1;
   }
-  controller->abar->ghc.ie = 1;
+
+  // enable ahci mode and interrupts
+  controller->abar->ghc |= (HBA_GHC_IRQ_ENABLE | HBA_GHC_AHCI_ENABLE);
+  for (int irq = 8; irq < 16; irq++) {
+    nk_unmask_irq(irq);
+  }
+
+  // currently only support 64 bit addressing
+  if (!controller->abar->cap.s64a) {
+    ERROR("controller does not support 64 bit addressing\n");
+    return -1;
+  }
 
   // probe implemented ports for devices and initialize/identify any we find 
-  if (probe_ports(controller)) {
+  if (probe(controller)) {
     ERROR("could not probe ports\n");
   }
 
