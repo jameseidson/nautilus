@@ -254,8 +254,23 @@ typedef enum {
 } ata_cmd_t;
 
 typedef struct {
+  union {
+    void *dba;
+    struct {
+      uint32_t dba_l;		   // Data base address lower 32 bits
+      uint32_t dba_u;		   // Data base address upper 32 bits
+    } __attribute__((packed));
+  };                 // Data base address
+  uint32_t rsv0;		 // Reserved
+
+  uint32_t dbc:22;	 // Byte count, 4M max
+  uint32_t rsv1:9;	 // Reserved
+  uint32_t i:1;		   // Interrupt on completion
+} __attribute__((packed)) prdt_entry_t;
+
+typedef struct {
   // 0x00
-  fis_h2d_t cfis;      // Command FIS
+  uint8_t cfis[64];    // Command FIS
 
   // 0x40
   uint8_t acmd[16];    // ATAPI command
@@ -264,20 +279,7 @@ typedef struct {
   uint8_t rsv[48];	   // Reserved
 
   // 0x80
-  struct {
-    union {
-      void *dba;
-      struct {
-        uint32_t dba_l;		   // Data base address lower 32 bits
-        uint32_t dba_u;		   // Data base address upper 32 bits
-      } __attribute__((packed));
-    };                 // Data base address
-
-    uint32_t rsv0;		 // Reserved
-    uint32_t dbc:22;	 // Byte count, 4M max
-    uint32_t rsv1:9;	 // Reserved
-    uint32_t i:1;		   // Interrupt on completion
-  } __attribute__((packed)) prdt_entry[CMD_TBL_NUM_PRDT];  // Physical region descriptor table entries, 0 ~ 65535
+  prdt_entry_t prdt[CMD_TBL_NUM_PRDT];  // Physical region descriptor table entries, 0 ~ 65535
 } __attribute__((packed)) cmd_table_t;
 
 
@@ -702,11 +704,11 @@ static int port_issue_cmd(ahci_port_state_t *s, fis_h2d_t *cmd, void *buf, size_
   // copy the command into the command table
   memcpy(&cl_entry->ctba->cfis, cmd, sizeof(fis_h2d_t));
 
-  cl_entry->ctba->prdt_entry[0].dba = buf;
+  cl_entry->ctba->prdt[0].dba = buf;
   // this field is 0 indexed so we subtract 1
-  cl_entry->ctba->prdt_entry[0].dbc = len == 0 ? len - 1 : 0;
+  cl_entry->ctba->prdt[0].dbc = len == 0 ? len - 1 : 0;
   // interrupt when command completes
-  cl_entry->ctba->prdt_entry[0].i = 1;
+  cl_entry->ctba->prdt[0].i = 1;
 
   cl_entry->cfl = sizeof(cmd) / 4;
   cl_entry->a = 0;
@@ -768,11 +770,11 @@ void identify_callback(nk_block_dev_status_t status, void *context) {
 
   DEBUG("WE CALLED THE CALLBACK AND OUR TC IS %d\n", fis->tc);
 
-  uint16_t *buf = s->regs->clb[0].ctba->prdt_entry[0].dba;
+  uint16_t *buf = s->regs->clb[0].ctba->prdt[0].dba;
 
-  // for (int i = 0; i < 256; i++) {
-  //   DEBUG("field %d: %x\n", i, buf[i]);
-  // }
+  for (int i = 0; i < 256; i++) {
+    DEBUG("field %d: %x\n", i, buf[i]);
+  }
 }
 
 static int port_identify(ahci_port_state_t *s) {
@@ -798,11 +800,11 @@ static int port_identify(ahci_port_state_t *s) {
   cmd_table_t *cmdtbl = cmdhdr->ctba;
   memset(cmdtbl, 0, sizeof(cmd_table_t));
 
-  cmdtbl->prdt_entry[0].dba = buf;
-  cmdtbl->prdt_entry[0].dbc = (256 * sizeof(uint16_t)) - 1;
-  cmdtbl->prdt_entry[0].i = 0;
+  cmdtbl->prdt[0].dba = buf;
+  cmdtbl->prdt[0].dbc = (256 * sizeof(uint16_t)) - 1;
+  cmdtbl->prdt[0].i = 0;
 
-  fis_h2d_t *cmdfis = &cmdtbl->cfis;
+  fis_h2d_t *cmdfis = (fis_h2d_t *)(&cmdtbl->cfis);
   memset(cmdfis, 0, sizeof(fis_h2d_t));
   cmdfis->fis_type = FIS_TYPE_REG_H2D;
   cmdfis->command = ATA_CMD_IDENTIFY_PIO;
@@ -854,15 +856,21 @@ static int port_identify_blocking(ahci_port_state_t *s) {
   cmd_table_t *cmdtbl = cmdhdr->ctba;
   memset(cmdtbl, 0, sizeof(cmd_table_t));
 
-  cmdtbl->prdt_entry[0].dba = buf;
-  cmdtbl->prdt_entry[0].dbc = (256 * sizeof(uint16_t)) - 1;
-  cmdtbl->prdt_entry[0].i = 0;
+  cmdtbl->prdt[0].dba = buf;
+  cmdtbl->prdt[0].dbc = (256 * sizeof(uint16_t)) - 1;
+  cmdtbl->prdt[0].i = 0;
 
-  fis_h2d_t *cmdfis = &cmdtbl->cfis;
+  fis_h2d_t *cmdfis = (fis_h2d_t *)(&cmdtbl->cfis);
   memset(cmdfis, 0, sizeof(fis_h2d_t));
   cmdfis->fis_type = FIS_TYPE_REG_H2D;
   cmdfis->command = ATA_CMD_IDENTIFY_PIO;
   cmdfis->c = 1;
+
+  // DEBUG("length of fis_h2d_t: %d\n", sizeof(fis_h2d_t));
+  DEBUG("cmd table base addr: %p\n", cmdhdr->ctba);
+  DEBUG("acmd address: %p\n", &cmdtbl->acmd);
+  DEBUG("prdt address: %p\n", &cmdtbl->prdt);
+  DEBUG("dba address: %p\n", &cmdtbl->prdt[0].dba);
 
   size_t spin = 0;
   while ((s->regs->tfd & (PORT_TFD_BUSY | PORT_TFD_DATA_REQ)) && spin < 1000000) {
@@ -905,19 +913,19 @@ static int port_identify_blocking(ahci_port_state_t *s) {
   //   DEBUG("field %d: %x\n", i, buf[i]);
   // }
 
-  // if (!((buf[83] >> 10) & 0x1)) { 
-  //   ERROR("LBA48 not supported on this drive\n");
-  //   return -1;
-  // } else {
-  //   size_t num_blocks = 
-  //     (((uint64_t) buf[103]) << 48) +
-	//     (((uint64_t) buf[102]) << 32) +
-	//     (((uint64_t) buf[101]) << 16) +
-	//     (((uint64_t) buf[100]) <<  0) ;
+  if (!((buf[83] >> 10) & 0x1)) { 
+    ERROR("LBA48 not supported on this drive\n");
+    return -1;
+  } else {
+    size_t num_blocks = 
+      (((uint64_t) buf[103]) << 48) +
+	    (((uint64_t) buf[102]) << 32) +
+	    (((uint64_t) buf[101]) << 16) +
+	    (((uint64_t) buf[100]) <<  0) ;
 
-  //   DEBUG("LBA48 supported, block data is %x %x %x %x\n", buf[103], buf[102], buf[101], buf[100]);
-  //   DEBUG("Interpretted as numblocks=0x%x\n", num_blocks);
-  // }
+    DEBUG("LBA48 supported, block data is %x %x %x %x\n", buf[103], buf[102], buf[101], buf[100]);
+    DEBUG("Interpretted as numblocks=0x%x\n", num_blocks);
+  }
 
 
   return 0;
@@ -1022,15 +1030,15 @@ static int probe(ahci_controller_state_t *controller) {
           // dev->regs->ie = (PORT_IE_D2H | PORT_IE_PIO_SETUP | PORT_IE_TF_ERR);
           dev->regs->ie = -1;
           
-          if (port_identify(dev)) {
-            ERROR("port %d: failed to identify sata device\n", i);
-            return -1;
-          }
-
-          // if (port_identify_blocking(dev)) {
+          // if (port_identify(dev)) {
           //   ERROR("port %d: failed to identify sata device\n", i);
           //   return -1;
           // }
+
+          if (port_identify_blocking(dev)) {
+            ERROR("port %d: failed to identify sata device\n", i);
+            return -1;
+          }
 
           break;
         } default: {
