@@ -43,6 +43,12 @@
 #define HBA_PORT_DET_DETECTED 3
 
 #define ATA_BLKSIZE 512
+#define ATA_IDENTITY_LEN (512 * sizeof(uint16_t))
+
+#define ATA_CFG_CMD_IRQ_DISABLE (1 << 10)
+#define ATA_CFG_CMD_BUSMASTER (1 << 2)
+#define ATA_CFG_CMD_MEMSPACE (1 << 1)
+#define ATA_CFG_CMD_IOSPACE 1
 
 typedef enum {
   SATA_SIG_ATA   = 0x00000101,  // SATA drive
@@ -479,27 +485,31 @@ typedef volatile struct {
 
 // LOCAL STATE DECLARATIONS
 
-typedef void (*callback_t)(nk_block_dev_status_t, void *);
+typedef int (ahci_cmd_callback_t)(nk_block_dev_status_t, void *);
+
+typedef struct ahci_cmd_continuation {
+  ahci_cmd_callback_t *cb;
+  void *context;
+} ahci_cmd_continuation_t;
 
 typedef struct ahci_cmd_state {
+  uint8_t nslots;
   // lock for `running`
   spinlock_t lock;
   // threads wait on this for an available slot
   nk_condvar_t slot_avail;
-
-  uint8_t nslots;
   // 1-bit indicates a command is currently running; this is a shared resource
   uint32_t running;
 
   // continuation to call when a command finishes 
-  struct {
-    callback_t cb;
-    void *context;
-  } conts[CMD_LIST_SIZE];
+  struct ahci_cmd_continuation conts[CMD_LIST_SIZE];
 } ahci_cmd_state_t;
 
 typedef struct ahci_port_state {
   struct ahci_controller_state *parent;
+
+  // response from ata_identify, stored here to ensure it doesn't leak
+  uint16_t *ata_identity;
 
   // the inherited interface
   struct nk_block_dev *blkdev;
@@ -525,8 +535,9 @@ typedef struct ahci_controller_state {
 // EXPORTED INTERFACE
 
 static int get_characteristics(void *state, struct nk_block_dev_characteristics *c);
-static int read_blocks(void *state, uint64_t blocknum, uint64_t count, uint8_t *dest, callback_t, void *context);
-static int write_blocks(void *state, uint64_t blocknum, uint64_t count, uint8_t *src, callback_t, void *context);
+static int read_blocks(void *state, uint64_t blocknum, uint64_t count, uint8_t *dest, void (*callback)(nk_block_dev_status_t status, void *context), void *context);
+static int write_blocks(void *state, uint64_t blocknum, uint64_t count, uint8_t *src, void (*callback)(nk_block_dev_status_t status, void *context), void *context);
+
 
 static struct nk_block_dev_int interface = {
     .get_characteristics = get_characteristics,
@@ -732,35 +743,40 @@ static int port_handle_irq(ahci_port_state_t *p) {
     }
   }
 
-  if (p->cmds.conts[slot].cb) {
-    p->cmds.conts[slot].cb(status, p->cmds.conts[slot].context);
+  // clear interrupt status
+  p->regs->is = -1;
+
+  // call the continuation if it was saved
+  int err = 0;
+  ahci_cmd_continuation_t *cont = &p->cmds.conts[slot];
+  if (cont->cb) {
+    err = cont->cb(status, cont->context);
   }
 
   cmdlist_mark_slot_avail(p, slot);
 
   WRITEBACK_REG(p->regs->is);
-  return 0;
+  return err;
 }
 
-static void port_identify_callback(nk_block_dev_status_t status, void *context) {
+static int port_identify_callback(nk_block_dev_status_t status, void *context) {
   ahci_port_state_t *p = context;
   fis_pio_setup_t *fis = &p->regs->fb->psfis;
 
   // get slot of command that was issued and buffer that device wrote 
-  uint8_t slot = p->regs->cmd.ccs;
-  uint16_t *buf = p->regs->clb[slot].ctba->prdt[slot].dba;
+  // uint8_t slot = p->regs->cmd.ccs;
+  // uint16_t *buf = p->regs->clb[slot].ctba->prdt[slot].dba;
 
-  if (!((buf[83] >> 10) & 0x1)) { 
-    ERROR("LBA48 not supported on this drive\n");
-    // TODO: should probably signal an error... but how?
-    return;
+  if (!((p->ata_identity[83] >> 10) & 0x1)) { 
+    ERROR("[port %d] LBA48 not supported on this drive\n", p->num);
+    return -1;
   }
 
   size_t nblks = 
-    (((uint64_t) buf[103]) << 48) +
-    (((uint64_t) buf[102]) << 32) +
-    (((uint64_t) buf[101]) << 16) +
-    (((uint64_t) buf[100]) <<  0) ;
+    (((uint64_t) p->ata_identity[103]) << 48) +
+    (((uint64_t) p->ata_identity[102]) << 32) +
+    (((uint64_t) p->ata_identity[101]) << 16) +
+    (((uint64_t) p->ata_identity[100]) <<  0) ;
 
   DEBUG("[port %d] LBA48 supported, blocksize is %d\n", p->num, nblks);
 
@@ -771,22 +787,12 @@ static void port_identify_callback(nk_block_dev_status_t status, void *context) 
   p->blkdev = nk_block_dev_register(name, 0, &interface, p);
   p->chars.block_size = ATA_BLKSIZE;
   p->chars.num_blocks = nblks;
+
+  return 0;
 }
 
 static int port_identify(ahci_port_state_t *p) {
   DEBUG("[port %d] identifying sata device\n", p->num);
-
-  // TODO: probably shouldn't be mallocing here, don't think we can free it in an 
-  //       interrupt context, plus we'll need to do something similar when we send
-  //       blkdev read and write commands and a malloc there would cause bad leak
-  // solution: malloc dba for implemented ports during init, need to determine max
-  //       length of buffer... should be in spec somewhere; what happens if we need
-  //       multiple prdts?
-  size_t buflen = 256 * sizeof(uint16_t);
-  uint16_t *buf = malloc(buflen);
-  memset(buf, 0, buflen);
-
-  p->regs->is = -1;
 
   int slot = cmdlist_claim_slot(p);
   if (slot == -1) {
@@ -801,8 +807,8 @@ static int port_identify(ahci_port_state_t *p) {
   cmd_table_t *cmdtbl = cmdhdr->ctba;
   memset(cmdtbl, 0, sizeof(cmd_table_t));
 
-  cmdtbl->prdt[0].dba = buf;
-  cmdtbl->prdt[0].dbc = (buflen) - 1;
+  cmdtbl->prdt[0].dba = p->ata_identity;
+  cmdtbl->prdt[0].dbc = (ATA_IDENTITY_LEN) - 1;
   cmdtbl->prdt[0].i = 0;
 
   fis_h2d_t *cmdfis = (fis_h2d_t *)(&cmdtbl->cfis);
@@ -835,16 +841,16 @@ static int port_init(ahci_controller_state_t *c, int num) {
   ata_dev_t type = get_dev_type(regs);
 
   // allocate command list
-  uint8_t n_slots = c->abar->cap.ncs;
-  regs->clb = malloc(n_slots * sizeof(cmd_hdr_t));
+  uint8_t nslots = c->abar->cap.ncs;
+  regs->clb = malloc(nslots * sizeof(cmd_hdr_t));
   if (!regs->clb) {
     ERROR("[port %d] could not allocate command list\n", num);
     return -1;
   }
-  memset(regs->clb, 0, n_slots * sizeof(cmd_hdr_t));
+  memset(regs->clb, 0, nslots * sizeof(cmd_hdr_t));
 
   // allocate a command table in each header within the list 
-  for (int i = 0; i < n_slots; i++) {
+  for (int i = 0; i < nslots; i++) {
     regs->clb[i].ctba = malloc(sizeof(cmd_table_t));
     if (!regs->clb[i].ctba) {
       ERROR("[port %d] could not allocate command table\n", num);
@@ -866,6 +872,12 @@ static int port_init(ahci_controller_state_t *c, int num) {
 
   // set up device state, at this point it has not yet been registered
   ahci_port_state_t *p = &(c->ports[num]);
+  p->ata_identity = malloc(ATA_IDENTITY_LEN);
+  if (!p->ata_identity) {
+    ERROR("[port %d] could not allocate ata identify block\n", num);
+    return -1;
+  }
+  memset(p->ata_identity, 0, ATA_IDENTITY_LEN);
   p->type = type;
   p->num = num;
   p->regs = regs;
@@ -958,10 +970,10 @@ static int controller_init(struct naut_info* naut, ahci_controller_state_t *cont
         controller->abar = (hba_reg_t *)pci_dev_get_bar_addr(pdev, 5);
         controller->pdev = pdev;
 
-        // allow device to use DMA
+        // allow device to use DMA + make sure interrupts are enabled
         uint16_t cmdreg = pci_cfg_readw(bus->num, pdev->num, 0, 0x4);
-        // enable busmaster + interrupts
-        cmdreg |= 0x7;
+        cmdreg |= ATA_CFG_CMD_IOSPACE | ATA_CFG_CMD_MEMSPACE | ATA_CFG_CMD_BUSMASTER;
+        cmdreg &= ~ATA_CFG_CMD_IRQ_DISABLE;
         pci_cfg_writew(bus->num, pdev->num, 0, 0x4, cmdreg);
 
         uint16_t stat = pci_cfg_readw(bus->num, pdev->num, 0, 0x6);
@@ -986,6 +998,7 @@ static int ahci_handle_irq(excp_entry_t *excp, excp_vec_t vec, void *state) {
 
       if (port_handle_irq(&c->ports[i])) {
         ERROR("[port %d] failed to handle irq\n", i);
+        IRQ_HANDLER_END();
         return -1;
       }
       is <<= 1;
@@ -1049,12 +1062,12 @@ static int get_characteristics(void *state, struct nk_block_dev_characteristics 
   return 0;
 }
 
-static int read_blocks(void *state, uint64_t blocknum, uint64_t count, uint8_t *dest, callback_t, void *context) {
+static int read_blocks(void *state, uint64_t blocknum, uint64_t count, uint8_t *dest, void (*callback)(nk_block_dev_status_t status, void *context), void *context) {
   ahci_port_state_t *p = (ahci_port_state_t *)state;
   return 0;
 }
 
-static int write_blocks(void *state, uint64_t blocknum, uint64_t count, uint8_t *src, callback_t, void *context) {
+static int write_blocks(void *state, uint64_t blocknum, uint64_t count, uint8_t *src, void (*callback)(nk_block_dev_status_t status, void *context), void *context) {
   ahci_port_state_t *p = (ahci_port_state_t *)state;
   return 0;
 }
