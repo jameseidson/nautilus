@@ -35,20 +35,24 @@
 #define CONTROLLER_CLASS    0x01    // mass storage device
 #define CONTROLLER_SUBCLASS 0x06    // serial ATA
 
-#define CMD_LIST_SIZE 32
-#define CMD_TBL_NUM_PRDT 1
-
 #define HBA_MAX_PORTS 32
 #define HBA_PORT_IPM_ACTIVE 1
 #define HBA_PORT_DET_DETECTED 3
 
 #define ATA_BLKSIZE 512
-#define ATA_IDENTITY_LEN (512 * sizeof(uint16_t))
 
 #define ATA_CFG_CMD_IRQ_DISABLE (1 << 10)
 #define ATA_CFG_CMD_BUSMASTER (1 << 2)
 #define ATA_CFG_CMD_MEMSPACE (1 << 1)
 #define ATA_CFG_CMD_IOSPACE 1
+
+#define FIS_DEVICE_LBAMODE (1 << 6)
+#define FIS_MAX_NBLKS 65536
+#define CMD_LIST_SIZE 32
+// each prdt can hold up to 8K
+#define PRDT_MAX_LEN (8 * 1024)
+#define PRDT_MAX_NBLKS (PRDT_MAX_LEN / ATA_BLKSIZE)
+#define CMD_TBL_NUM_PRDT 65535
 
 typedef enum {
   SATA_SIG_ATA   = 0x00000101,  // SATA drive
@@ -102,8 +106,14 @@ typedef struct {
 	uint8_t featureh; // Feature register, 15:8
  
   // DWORD 3
-  uint8_t countl;		// Count register, 7:0
-  uint8_t counth;		// Count register, 15:8
+  union {
+    uint16_t count; // Count register, 7:15
+    struct {
+      uint8_t count_l; // Count low
+      uint8_t count_h; // Count high
+    } __attribute__((packed));
+  };
+
   uint8_t icc;		  // Isochronous command completion
   uint8_t control;	// Control register
  
@@ -256,13 +266,15 @@ typedef volatile struct{
  
   // 0xA0
   uint8_t rsv[0x100-0xA0];
-} __attribute__((packed)) fis_hba_t;
+} __attribute__((packed, aligned(256))) fis_hba_t;
 
 // COMMAND LIST DECLARATIONS
 
 typedef enum {
   ATA_CMD_IDENTIFY_DMA = 0xEE,
   ATA_CMD_IDENTIFY_PIO = 0xEC,
+  ATA_CMD_READ_DMA_EXT = 0x25,
+  ATA_CMD_WRITE_DMA_EXT = 0x35,
 } ata_cmd_t;
 
 typedef struct {
@@ -292,7 +304,7 @@ typedef struct {
 
   // 0x80
   prdt_entry_t prdt[CMD_TBL_NUM_PRDT];  // Physical region descriptor table entries, 0 ~ 65535
-} __attribute__((packed)) cmd_table_t;
+} __attribute__((packed, aligned(128))) cmd_table_t;
 
 typedef struct {
   // DW0
@@ -323,7 +335,7 @@ typedef struct {
 
   // DW4 - 7
   uint32_t rsv1[4];	// Reserved
-} __attribute__((packed)) cmd_hdr_t;
+} __attribute__((packed, aligned(1024))) cmd_hdr_t;
 
 // AHCI REGISTER DECLARATIONS
 
@@ -485,7 +497,7 @@ typedef volatile struct {
 
 // LOCAL STATE DECLARATIONS
 
-typedef int (ahci_cmd_callback_t)(nk_block_dev_status_t, void *);
+typedef void (ahci_cmd_callback_t)(nk_block_dev_status_t, void *);
 
 typedef struct ahci_cmd_continuation {
   ahci_cmd_callback_t *cb;
@@ -509,7 +521,7 @@ typedef struct ahci_port_state {
   struct ahci_controller_state *parent;
 
   // response from ata_identify, stored here to ensure it doesn't leak
-  uint16_t *ata_identity;
+  uint16_t * __attribute__((aligned(2))) ata_identity;
 
   // the inherited interface
   struct nk_block_dev *blkdev;
@@ -517,7 +529,7 @@ typedef struct ahci_port_state {
 
   uint8_t num;
   ata_dev_t type;
-  // points to port resters within abar
+  // points to port registers within abar
   hba_port_reg_t *regs;
   // state of the commands currently being processed by the port
   struct ahci_cmd_state cmds;
@@ -538,7 +550,6 @@ static int get_characteristics(void *state, struct nk_block_dev_characteristics 
 static int read_blocks(void *state, uint64_t blocknum, uint64_t count, uint8_t *dest, void (*callback)(nk_block_dev_status_t status, void *context), void *context);
 static int write_blocks(void *state, uint64_t blocknum, uint64_t count, uint8_t *src, void (*callback)(nk_block_dev_status_t status, void *context), void *context);
 
-
 static struct nk_block_dev_int interface = {
     .get_characteristics = get_characteristics,
     .read_blocks = read_blocks,
@@ -548,6 +559,21 @@ static struct nk_block_dev_int interface = {
 // FUNCTION DEFINITIONS
 
 // helpers
+
+// struct cmd_callback_wrapper_args {
+//   void (*wrapped)(nk_block_dev_status_t, void *);
+//   void *context;
+// };
+
+// static inline int cmd_callback_wrapper(nk_block_dev_status_t status, void *context) {
+//   // ahci_cmd_callback_t's return an error code, but interface callbacks don't
+//   // this function converts an interface callback into an ahci_cmd_callback
+//   struct cmd_callback_wrapper_args *args = context;
+
+//   args->wrapped(status, args->context); 
+//   // always signal no error
+//   return 0;
+// }
 
 static inline int cmdlist_get_completed(ahci_port_state_t *p) {
   LOCK_CONF;
@@ -646,72 +672,69 @@ static inline void controller_reset(ahci_controller_state_t *c) {
 
 // subroutines
 
-// issue an ATA command
-// buf: data buffer
-// len: length of data buffer in bytes
-/*
-static int port_cmd(ahci_port_state_t *s, fis_h2d_t *cmd, void *buf, size_t len, cmd_callback_t callback, void *cb_context) {
-  if (len > CMD_TBL_NUM_PRDT * (1LLU << 22)) {
-    // we can only store 4 MiB of data per prdt entry and currently only 1 prdt entry is used
-    ERROR("command result buffer length must be <= 4 MiB");
-    return -1;
-  }
+static inline int port_issue_cmd(ahci_port_state_t *p, fis_h2d_t cmdfis, ahci_cmd_continuation_t cont, uint8_t *data, uint64_t nblks) {
+  // clear interrupt bits
+  p->regs->is = -1;
 
-  int slot = find_cmd_slot(s);
+  int slot = cmdlist_claim_slot(p);
   if (slot == -1) {
-    ERROR("could not find unclaimed slot for new command\n");
+    ERROR("[port %d] could not claim command slot\n", p->num);
+  }
+  DEBUG("[port %d] issuing command 0x%x to device on slot %d\n", p->num, cmdfis.command, slot);
+
+  cmd_hdr_t *cmdhdr = &p->regs->clb[slot];
+  memset(cmdhdr, 0, sizeof(cmd_hdr_t));
+  // length of cmd fis in dwords 
+  cmdhdr->cfl = sizeof(fis_h2d_t) / sizeof(uint32_t);
+  // determine how many prdt entries we need
+  cmdhdr->prdtl = ((nblks - 1) / PRDT_MAX_NBLKS) + 1;
+  cmdhdr->c = 1;
+  cmdhdr->w = cmdfis.command == ATA_CMD_WRITE_DMA_EXT;
+  cmdhdr->a = cmdfis.command == (ATA_CMD_IDENTIFY_PIO || ATA_CMD_IDENTIFY_DMA);
+
+  cmd_table_t *cmdtbl = cmdhdr->ctba;
+  memset(cmdtbl, 0, sizeof(cmd_table_t));
+  uint16_t i = 0;
+  for (i = 0; i < cmdhdr->prdtl - 1; i++) {
+    cmdtbl->prdt[i].dba = data;
+    // subtract 1 because dbc is 0-based
+    cmdtbl->prdt[i].dbc = PRDT_MAX_LEN - 1;
+    data += PRDT_MAX_LEN;
+    nblks -= PRDT_MAX_NBLKS;
+  }
+  cmdtbl->prdt[i].dba = data;
+  cmdtbl->prdt[i].dbc = (nblks * ATA_BLKSIZE) - 1;
+  // we want device to trigger an interrupt when it finishes processing the last prdt
+  cmdtbl->prdt[i].i = 1;
+
+  memcpy(cmdtbl->cfis, &cmdfis, sizeof(fis_h2d_t));
+
+  // TODO: should not use task file data to determine if busy, section 9.3.7
+  size_t spin = 0;
+  while ((p->regs->tfd & (PORT_TFD_BUSY | PORT_TFD_DATA_REQ)) && spin < 1000000) {
+    spin++;
+  }
+  if (spin == 1000000) {
+    ERROR("[port %d] hung\n", p->num);
     return -1;
   }
+  
+  p->cmds.conts[slot] = cont;
 
-  DEBUG("[port %d] issuing command in slot %d\n", s->num, slot);
-
-  cmd_hdr_t *cl_entry = &s->regs->clb[slot];
-  // copy the command into the command table
-  memcpy(&cl_entry->ctba->cfis, cmd, sizeof(fis_h2d_t));
-
-  cl_entry->ctba->prdt[0].dba = buf;
-  // this field is 0 indexed so we subtract 1
-  cl_entry->ctba->prdt[0].dbc = len == 0 ? len - 1 : 0;
-  // interrupt when command completes
-  cl_entry->ctba->prdt[0].i = 1;
-
-  cl_entry->cfl = sizeof(cmd) / 4;
-  cl_entry->a = 0;
-  cl_entry->w = 0;
-  cl_entry->p = 0;
-  cl_entry->r = 0;
-  cl_entry->b = 0;
-  cl_entry->c = 1;
-  cl_entry->prdtl = CMD_TBL_NUM_PRDT;
-  cl_entry->prdbc = 0;
-
-  // issue the command and save state for when it finishes
-  uint8_t flags = spin_lock_irq_save(&s->cmdlock);
-  s->cmd_cont[slot].running = 1;
-  s->cmd_cont[slot].callback = callback;
-  s->cmd_cont[slot].context = cb_context;
-  s->regs->ci |= (1U << slot);
-  spin_unlock_irq_restore(&s->cmdlock, flags);
-
-  // while (1) {
-  //   uint16_t stat = pci_dev_cfg_readw(s->controller->pdev, 0x6);
-  //   DEBUG("PCI status: 0x%04x\n", stat);
-  //   DEBUG("GHC interrupt status: %x\n", s->controller->abar->is);
-  //   DEBUG("Port interrupt status: %x\n", s->regs->is.val);
-  //   DEBUG("GHC interrupt status: %x\n", atomic_load(&s->controller->abar->is));
-  //   DEBUG("Port interrupt status: %x\n", atomic_load(&s->regs->is.val));
-  // }
+  // issue the command
+  p->regs->ci |= (1 << slot);
 
   return 0;
 }
-*/
 
 static int port_handle_irq(ahci_port_state_t *p) {
   uint32_t is = p->regs->is;
 
-  // check for task file errors
   if (is & PORT_IS_TF_ERR) {
-    ERROR("port: %d: task file error\n", p->num);
+    DEBUG("STATUS: 0x%x\n", is);
+    ERROR("[port: %d] task file error\n", p->num);
+    fis_d2h_t *fis = &p->regs->fb->rfis;
+    DEBUG("FIS err reg: 0x%x, FIS status reg: 0x%x\n", fis->error, fis->status.val);
     return -1;
   }
 
@@ -723,7 +746,7 @@ static int port_handle_irq(ahci_port_state_t *p) {
 
   int slot = cmdlist_get_completed(p);
   if (slot == -1) {
-    DEBUG("[port %d] no commands have been completed so this interrupt is unexpected, ignoring\n", p->num);
+    DEBUG("[port %d] no commands have been completed so irq was unexpected, ignoring\n", p->num);
     return 0;
   }
 
@@ -731,9 +754,9 @@ static int port_handle_irq(ahci_port_state_t *p) {
   nk_block_dev_status_t status = NK_BLOCK_DEV_STATUS_SUCCESS;
 
   if (is & PORT_IS_PIO_SETUP) {
-    DEBUG("[port %d] interrupt was for a PIO setup command\n", p->num);
+    DEBUG("[port %d] irq was for PIO setup command\n", p->num);
   } else if (is & PORT_IS_D2H) {
-    DEBUG("[port %d] interrupt was for a d2h command\n", p->num);
+    DEBUG("[port %d] irq was for D2H command\n", p->num);
 
     fis_d2h_t *fis = &p->regs->fb->rfis;
     if (fis->status.err || fis->status.bsy || fis->status.rdy) {
@@ -743,97 +766,55 @@ static int port_handle_irq(ahci_port_state_t *p) {
     }
   }
 
-  // clear interrupt status
-  p->regs->is = -1;
-
-  // call the continuation if it was saved
-  int err = 0;
+  // call the continuation if it exists
   ahci_cmd_continuation_t *cont = &p->cmds.conts[slot];
   if (cont->cb) {
-    err = cont->cb(status, cont->context);
+    cont->cb(status, cont->context);
   }
 
   cmdlist_mark_slot_avail(p, slot);
 
   WRITEBACK_REG(p->regs->is);
-  return err;
+  return 0;
 }
 
-static int port_identify_callback(nk_block_dev_status_t status, void *context) {
+static void port_identify_callback(nk_block_dev_status_t status, void *context) {
   ahci_port_state_t *p = context;
   fis_pio_setup_t *fis = &p->regs->fb->psfis;
 
-  // get slot of command that was issued and buffer that device wrote 
-  // uint8_t slot = p->regs->cmd.ccs;
-  // uint16_t *buf = p->regs->clb[slot].ctba->prdt[slot].dba;
-
   if (!((p->ata_identity[83] >> 10) & 0x1)) { 
-    ERROR("[port %d] LBA48 not supported on this drive\n", p->num);
-    return -1;
+    ERROR("[port %d] could not identify, LBA48 not supported on this drive\n", p->num);
+    return;
   }
 
-  size_t nblks = 
+  p->chars.block_size = ATA_BLKSIZE;
+  p->chars.num_blocks = 
     (((uint64_t) p->ata_identity[103]) << 48) +
     (((uint64_t) p->ata_identity[102]) << 32) +
     (((uint64_t) p->ata_identity[101]) << 16) +
     (((uint64_t) p->ata_identity[100]) <<  0) ;
 
-  DEBUG("[port %d] LBA48 supported, blocksize is %d\n", p->num, nblks);
+  DEBUG("[port %d] LBA48 supported, device has %d blocks\n", p->num, p->chars.num_blocks);
 
   // register the device (TODO: is this safe to call in an interrupt context?)
   char name[32];
   sprintf(name, "ahci-%d-%d", p->num, p->type);
   INFO("[port %d] initializing block device %s with type %d\n", p->num, name, p->type);
   p->blkdev = nk_block_dev_register(name, 0, &interface, p);
-  p->chars.block_size = ATA_BLKSIZE;
-  p->chars.num_blocks = nblks;
-
-  return 0;
 }
 
 static int port_identify(ahci_port_state_t *p) {
-  DEBUG("[port %d] identifying sata device\n", p->num);
+  fis_h2d_t cmdfis;
+  memset(&cmdfis, 0, sizeof(fis_h2d_t));
+  cmdfis.fis_type = FIS_TYPE_REG_H2D;
+  cmdfis.command = ATA_CMD_IDENTIFY_PIO;
+  cmdfis.c = 1;
 
-  int slot = cmdlist_claim_slot(p);
-  if (slot == -1) {
-    ERROR("[port %d] could not claim command slot\n", p->num);
-  }
+  ahci_cmd_continuation_t cont;
+  cont.cb = port_identify_callback;
+  cont.context = p;
 
-  cmd_hdr_t *cmdhdr = &p->regs->clb[slot];
-  cmdhdr->cfl = sizeof(fis_h2d_t) / sizeof(uint32_t);
-  cmdhdr->w = 0;
-  cmdhdr->prdtl = 1;
-
-  cmd_table_t *cmdtbl = cmdhdr->ctba;
-  memset(cmdtbl, 0, sizeof(cmd_table_t));
-
-  cmdtbl->prdt[0].dba = p->ata_identity;
-  cmdtbl->prdt[0].dbc = (ATA_IDENTITY_LEN) - 1;
-  cmdtbl->prdt[0].i = 0;
-
-  fis_h2d_t *cmdfis = (fis_h2d_t *)(&cmdtbl->cfis);
-  memset(cmdfis, 0, sizeof(fis_h2d_t));
-  cmdfis->fis_type = FIS_TYPE_REG_H2D;
-  cmdfis->command = ATA_CMD_IDENTIFY_PIO;
-  cmdfis->c = 1;
-
-  size_t spin = 0;
-  while ((p->regs->tfd & (PORT_TFD_BUSY | PORT_TFD_DATA_REQ)) && spin < 1000000) {
-    spin++;
-  }
-  if (spin == 1000000) {
-    ERROR("[port %d] hung\n", p->num);
-    return -1;
-  }
-  
-  p->cmds.conts[slot].cb = port_identify_callback;
-  p->cmds.conts[slot].context = p;
-
-  // issue the command
-  DEBUG("[port %d] issuing ata identify command to device from slot %d\n", p->num, slot);
-  p->regs->ci |= (1 << slot);
-
-  return 0;
+  return port_issue_cmd(p, cmdfis, cont, (uint8_t *)p->ata_identity, 1);
 }
 
 static int port_init(ahci_controller_state_t *c, int num) {
@@ -847,17 +828,21 @@ static int port_init(ahci_controller_state_t *c, int num) {
     ERROR("[port %d] could not allocate command list\n", num);
     return -1;
   }
+  if ((uint64_t)regs->clb & 0x3FF) {
+    ERROR("[port %d] command list was not 1K-byte aligned\n", num);
+    return -1;
+  }
   memset(regs->clb, 0, nslots * sizeof(cmd_hdr_t));
 
   // allocate a command table in each header within the list 
   for (int i = 0; i < nslots; i++) {
     regs->clb[i].ctba = malloc(sizeof(cmd_table_t));
     if (!regs->clb[i].ctba) {
-      ERROR("[port %d] could not allocate command table\n", num);
+      ERROR("[port %d] could not allocate command table %d\n", num, i);
       return -1;
     }
-    if((uint64_t)regs->clb[i].ctba & 0b1111111) {
-      ERROR("[port %d] command table was not 128 byte aligned\n", num);
+    if ((uint64_t)regs->clb[i].ctba & 0x7F) {
+      ERROR("[port %d] command table %d was not 128-byte aligned\n", num, i);
       return -1;
     }
     memset(regs->clb[i].ctba, 0, sizeof(cmd_table_t));
@@ -869,15 +854,23 @@ static int port_init(ahci_controller_state_t *c, int num) {
     ERROR("[port %d] could not allocate frame information structure\n", num);
     return -1;
   }
+  if ((uint64_t)regs->fb & 0xFF) {
+    ERROR("[port %d] frame information structure was not 256-byte aligned\n", num);
+    return -1;
+  }
 
   // set up device state, at this point it has not yet been registered
   ahci_port_state_t *p = &(c->ports[num]);
-  p->ata_identity = malloc(ATA_IDENTITY_LEN);
+  p->ata_identity = malloc(ATA_BLKSIZE);
   if (!p->ata_identity) {
     ERROR("[port %d] could not allocate ata identify block\n", num);
     return -1;
   }
-  memset(p->ata_identity, 0, ATA_IDENTITY_LEN);
+  if ((uint64_t)p->ata_identity & 1) {
+    ERROR("[port %d] ata identify block was not word-aligned\n", num);
+    return -1;
+  }
+  memset(p->ata_identity, 0, ATA_BLKSIZE);
   p->type = type;
   p->num = num;
   p->regs = regs;
@@ -913,7 +906,8 @@ static int probe(ahci_controller_state_t *c) {
           port_start_cmd(p);
 
           // enable interrupts
-          p->regs->ie = (PORT_IE_D2H | PORT_IE_PIO_SETUP | PORT_IE_TF_ERR);
+          // p->regs->ie = (PORT_IE_D2H | PORT_IE_PIO_SETUP | PORT_IE_TF_ERR);
+          p->regs->ie = -1;
           
           // send ata identify command, nonblocking
           if (port_identify(p)) {
@@ -1058,16 +1052,73 @@ int nk_ahci_init(struct naut_info* naut) {
 }
 
 static int get_characteristics(void *state, struct nk_block_dev_characteristics *c) {
+  ahci_port_state_t *p = (ahci_port_state_t *)state;
+
+  DEBUG("[port %d] get characteristics\n", p->num);
+
+  if (!p->blkdev) {
+    ERROR("[port %d] could not get characteristics, device was never identified\n", p->num);
+    return -1;
+  }
+
   *c = ((ahci_port_state_t *)state)->chars;
   return 0;
 }
 
 static int read_blocks(void *state, uint64_t blocknum, uint64_t count, uint8_t *dest, void (*callback)(nk_block_dev_status_t status, void *context), void *context) {
   ahci_port_state_t *p = (ahci_port_state_t *)state;
-  return 0;
+  uint64_t dest_uint = (uint64_t)dest;
+
+  DEBUG("[port %d] read %llu blocks starting at 0x%x\n", p->num, count, blocknum);
+
+  if (!p->blkdev) {
+    ERROR("[port %d] could not read blocks, device was never identified\n", p->num);
+    return -1;
+  }
+
+  if (dest_uint & 1) {
+    ERROR("[port %d] destination buffer must be word-aligned\n");
+    return -1;
+  }
+  
+  DEBUG("dest pointer: 0x%p\n", dest);
+  fis_h2d_t cmdfis;
+  memset(&cmdfis, 0, sizeof(fis_h2d_t));
+  cmdfis.fis_type = FIS_TYPE_REG_H2D;
+  cmdfis.c = 1;
+  cmdfis.command = ATA_CMD_READ_DMA_EXT;
+  cmdfis.lba0 = (uint8_t)dest_uint;
+  cmdfis.lba1 = (uint8_t)(dest_uint >> 8);
+  cmdfis.lba2 = (uint8_t)(dest_uint >> 16);
+  cmdfis.lba3 = (uint8_t)(dest_uint >> 24);
+  cmdfis.lba4 = (uint8_t)(dest_uint >> 32);
+  cmdfis.lba5 = (uint8_t)(dest_uint >> 40);
+  cmdfis.device = (uint8_t)FIS_DEVICE_LBAMODE;
+  cmdfis.count = (uint16_t)(count == FIS_MAX_NBLKS ? 0 : count);
+  DEBUG("LBA: %x %x %x %x %x %x\n", cmdfis.lba5, cmdfis.lba4, cmdfis.lba3, cmdfis.lba2, cmdfis.lba1, cmdfis.lba0);
+
+  ahci_cmd_continuation_t cont;
+  cont.cb = callback;
+  cont.context = context;
+
+  return port_issue_cmd(p, cmdfis, cont, dest, count);
 }
 
 static int write_blocks(void *state, uint64_t blocknum, uint64_t count, uint8_t *src, void (*callback)(nk_block_dev_status_t status, void *context), void *context) {
   ahci_port_state_t *p = (ahci_port_state_t *)state;
+  uint64_t src_uint = (uint64_t)src;
+
+  DEBUG("[port %d] write %llu blocks starting at 0x%x\n", p->num, count, blocknum);
+
+  if (!p->blkdev) {
+    ERROR("[port %d] could not write blocks, device was never identified\n", p->num);
+    return -1;
+  }
+
+  if (src_uint & 1) {
+    ERROR("[port %d] destination buffer must be word-aligned\n");
+    return -1;
+  }
+
   return 0;
 }
