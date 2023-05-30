@@ -538,6 +538,8 @@ typedef struct ahci_controller_state {
   struct ahci_port_state ports[HBA_MAX_PORTS];
 } ahci_controller_state_t;
 
+static int ahci_handle_irq(excp_entry_t *excp, excp_vec_t vec, void *state);
+
 static int get_characteristics(void *state, struct nk_block_dev_characteristics *c);
 static int read_blocks(void *state, uint64_t blocknum, uint64_t count, uint8_t *dest, void (*callback)(nk_block_dev_status_t status, void *context), void *context);
 static int write_blocks(void *state, uint64_t blocknum, uint64_t count, uint8_t *src, void (*callback)(nk_block_dev_status_t status, void *context), void *context);
@@ -547,6 +549,42 @@ static struct nk_block_dev_int interface = {
     .read_blocks         = read_blocks,
     .write_blocks        = write_blocks,
 };
+
+static inline void port_stop_cmd(ahci_port_state_t *p) {
+  p->regs->cmd.val &= ~(PORT_CMD_START | PORT_CMD_FIS);
+
+  while(p->regs->cmd.val & (PORT_CMD_START | PORT_CMD_FIS));
+}
+
+static inline void port_start_cmd(ahci_port_state_t *p) {
+  while (p->regs->cmd.val & PORT_CMD_RUNNING);
+
+  p->regs->cmd.val |= (PORT_CMD_START | PORT_CMD_FIS);
+}
+
+static inline void fis_readwrite_set_lba(fis_h2d_t *cmdfis, uint64_t blocknum, uint64_t count) {\
+  cmdfis->lba0 =  blocknum        & 0xff;
+  cmdfis->lba1 = (blocknum >>  8) & 0xff;
+  cmdfis->lba2 = (blocknum >> 16) & 0xff;
+  cmdfis->lba3 = (blocknum >> 24) & 0xff;
+  cmdfis->lba4 = (blocknum >> 32) & 0xff;
+  cmdfis->lba5 = (blocknum >> 40) & 0xff;
+
+  cmdfis->device = FIS_DEVICE_LBAMODE;
+  cmdfis->count = (count == FIS_MAX_NBLKS ? 0 : count) & 0xffff;
+}
+
+static inline ahci_dev_t ata_get_dev_type(hba_port_reg_t *regs) {
+  if (regs->ssts.det != PORT_SSTS_DET_DETECTED) return AHCI_DEV_NULL;
+  if (regs->ssts.ipm != PORT_SSTS_IPM_ACTIVE)   return AHCI_DEV_NULL;
+
+  switch (regs->sig) {
+    case SATA_SIG_ATAPI: return AHCI_DEV_SATAPI;
+    case SATA_SIG_SEMB:  return AHCI_DEV_SEMB;
+    case SATA_SIG_PM:    return AHCI_DEV_PM;
+    default:             return AHCI_DEV_SATA;
+  }
+}
 
 static inline int cmdlist_get_completed(ahci_port_state_t *p) {
   LOCK_CONF;
@@ -600,42 +638,6 @@ static int inline cmdlist_claim_slot(ahci_port_state_t *p) {
   return -1;
 }
 
-static inline void port_stop_cmd(ahci_port_state_t *p) {
-  p->regs->cmd.val &= ~(PORT_CMD_START | PORT_CMD_FIS);
-
-  while(p->regs->cmd.val & (PORT_CMD_START | PORT_CMD_FIS));
-}
-
-static inline void port_start_cmd(ahci_port_state_t *p) {
-  while (p->regs->cmd.val & PORT_CMD_RUNNING);
-
-  p->regs->cmd.val |= (PORT_CMD_START | PORT_CMD_FIS);
-}
-
-static inline void fis_readwrite_set_lba(fis_h2d_t *cmdfis, uint64_t blocknum, uint64_t count) {\
-  cmdfis->lba0 =  blocknum        & 0xff;
-  cmdfis->lba1 = (blocknum >>  8) & 0xff;
-  cmdfis->lba2 = (blocknum >> 16) & 0xff;
-  cmdfis->lba3 = (blocknum >> 24) & 0xff;
-  cmdfis->lba4 = (blocknum >> 32) & 0xff;
-  cmdfis->lba5 = (blocknum >> 40) & 0xff;
-
-  cmdfis->device = FIS_DEVICE_LBAMODE;
-  cmdfis->count = (count == FIS_MAX_NBLKS ? 0 : count) & 0xffff;
-}
-
-static inline ahci_dev_t ata_get_dev_type(hba_port_reg_t *regs) {
-  if (regs->ssts.det != PORT_SSTS_DET_DETECTED) return AHCI_DEV_NULL;
-  if (regs->ssts.ipm != PORT_SSTS_IPM_ACTIVE)   return AHCI_DEV_NULL;
-
-  switch (regs->sig) {
-    case SATA_SIG_ATAPI: return AHCI_DEV_SATAPI;
-    case SATA_SIG_SEMB:  return AHCI_DEV_SEMB;
-    case SATA_SIG_PM:    return AHCI_DEV_PM;
-    default:             return AHCI_DEV_SATA;
-  }
-}
-
 static inline void port_reset(ahci_port_state_t *p) {
   DEBUG("[port %d] resetting\n", p->num);
   p->regs->sctl.det = 0x1;
@@ -652,6 +654,42 @@ static inline void controller_reset(ahci_controller_state_t *c) {
   DEBUG("controller resetting\n");
   c->abar->ghc |= HBA_GHC_RESET;
   while (c->abar->ghc & HBA_GHC_RESET);
+}
+
+static inline int controller_irq_setup(ahci_controller_state_t *c) {
+  if (c->pdev->msi.type == PCI_MSI_NONE) {
+    ERROR("controller does not support msi\n");
+    return -1;
+  }
+  uint64_t nvecs = c->pdev->msi.num_vectors_needed;
+  uint64_t base_vec = 0;
+
+	if (idt_find_and_reserve_range(nvecs, 1, &base_vec)) {
+	    ERROR("could not find %d interrupt vectors for controller\n", nvecs);
+      return -1;
+	}
+
+  DEBUG("irq vectors are %d to %d\n", base_vec, base_vec + nvecs - 1);
+
+	if (pci_dev_enable_msi(c->pdev, base_vec, nvecs, 0)) {
+	    ERROR("could not enable msi for controller\n");
+	    return -1;
+	}
+
+  for (int i = base_vec; i < (base_vec + nvecs); i++) {
+    if (register_int_handler(i, ahci_handle_irq, c)) {
+      ERROR("could not register handler for interrupt vector %d\n", i);
+      return -1;
+    }
+  }
+
+  for (int i = base_vec; i < (base_vec + nvecs); i++) {
+    if (pci_dev_unmask_msi(c->pdev, i)) {
+      ERROR("could not unmask interrupt vector %d\n", i);
+		}
+  }
+
+  return 0;
 }
 
 static inline int port_issue_cmd(ahci_port_state_t *p, fis_h2d_t cmdfis, ahci_cmd_continuation_t cont, uint8_t *data, uint64_t nblks) {
@@ -902,7 +940,7 @@ static int probe(ahci_controller_state_t *c) {
   return 0;
 }
 
-static int controller_init(struct naut_info* naut, ahci_controller_state_t *controller) {
+static int controller_init(ahci_controller_state_t *c, struct naut_info *naut) {
   struct pci_info *pci = naut->sys.pci;
   struct list_head *curbus, *curdev;
   uint32_t num = 0;
@@ -933,8 +971,8 @@ static int controller_init(struct naut_info* naut, ahci_controller_state_t *cont
           return -1;
         }
 
-        controller->abar = (hba_reg_t *)pci_dev_get_bar_addr(pdev, 5);
-        controller->pdev = pdev;
+        c->abar = (hba_reg_t *)pci_dev_get_bar_addr(pdev, 5);
+        c->pdev = pdev;
 
         // allow device to use DMA + make sure interrupts are enabled
         uint16_t cmdreg = pci_cfg_readw(bus->num, pdev->num, 0, 0x4);
@@ -990,21 +1028,9 @@ int nk_ahci_init(struct naut_info* naut) {
   }
   memset(c, 0, sizeof(ahci_controller_state_t));
 
-  if (controller_init(naut, c)) {
+  if (controller_init(c, naut)) {
     INFO("could not find an ahci controller\n");
     return -1;
-  }
-  controller_reset(c);
-
-  if (register_int_handler(0xe4, ahci_handle_irq, c)) {
-    ERROR("could not register interrupt handler for controller\n");
-    return -1;
-  }
-
-  // enable ahci mode and interrupts
-  c->abar->ghc |= (HBA_GHC_AHCI_ENABLE | HBA_GHC_IRQ_ENABLE);
-  for (int irq = 8; irq < 16; irq++) {
-    nk_unmask_irq(irq);
   }
 
   // currently only support 64 bit addressing
@@ -1013,9 +1039,19 @@ int nk_ahci_init(struct naut_info* naut) {
     return -1;
   }
 
+  controller_reset(c);
+  
+  // set up interrupts and enable them, also enable ahci while we're at it
+  if (controller_irq_setup(c)) {
+    ERROR("could not setup interrupts for controller\n");
+    return -1;
+  }
+  c->abar->ghc |= (HBA_GHC_AHCI_ENABLE | HBA_GHC_IRQ_ENABLE);
+
   // probe implemented ports for devices and initialize/identify any we find 
   if (probe(c)) {
     ERROR("error probing ports\n");
+    return -1;
   }
 
   return 0;
