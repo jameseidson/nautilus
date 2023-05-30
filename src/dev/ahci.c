@@ -47,9 +47,9 @@
 #define ATA_CFG_CMD_MEMSPACE    (1 << 1)
 #define ATA_CFG_CMD_IOSPACE      1
 
-#define HBA_GHC_RESET        1
-#define HBA_GHC_IRQ_ENABLE  (1 << 1)
 #define HBA_GHC_AHCI_ENABLE (1 << 31)
+#define HBA_GHC_IRQ_ENABLE  (1 << 1)
+#define HBA_GHC_RESET        1
 
 #define PORT_CMD_RUNNING (1 << 15)
 #define PORT_CMD_FIS     (1 << 4)
@@ -71,8 +71,8 @@
 #define PORT_TFD_BUSY 0x80
 #define PORT_TFD_DRQ  0x08
 
-#define PORT_SSTS_IPM_ACTIVE   1
 #define PORT_SSTS_DET_DETECTED 3
+#define PORT_SSTS_IPM_ACTIVE   1
 
 #define FIS_DEVICE_LBAMODE (1 << 6)
 
@@ -121,16 +121,16 @@ typedef struct {
   uint8_t featurel;	// Feature register, 7:0
  
   // DWORD 1
-	uint8_t lba0;	 	  // LBA low register, 7:0
-	uint8_t lba1;	 	  // LBA mid register, 15:8
-	uint8_t lba2;	 	  // LBA high register, 23:16
-	uint8_t device;   // Device register
+  uint8_t lba0;	 	  // LBA low register, 7:0
+  uint8_t lba1;	 	  // LBA mid register, 15:8
+  uint8_t lba2;	 	  // LBA high register, 23:16
+  uint8_t device;   // Device register
  
   // DWORD 2
-	uint8_t lba3;		  // LBA register, 31:24
-	uint8_t lba4;		  // LBA register, 39:32
-	uint8_t lba5;		  // LBA register, 47:40
-	uint8_t featureh; // Feature register, 15:8
+  uint8_t lba3;		  // LBA register, 31:24
+  uint8_t lba4;		  // LBA register, 39:32
+  uint8_t lba5;		  // LBA register, 47:40
+  uint8_t featureh; // Feature register, 15:8
  
   // DWORD 3
   union {
@@ -172,16 +172,16 @@ typedef volatile struct {
   uint8_t error;       // Error register
  
   // DWORD 1
-	uint8_t lba0;        // LBA low register, 7:0
-	uint8_t lba1;        // LBA mid register, 15:8
-	uint8_t lba2;        // LBA high register, 23:16
-	uint8_t device;      // Device register
+  uint8_t lba0;        // LBA low register, 7:0
+  uint8_t lba1;        // LBA mid register, 15:8
+  uint8_t lba2;        // LBA high register, 23:16
+  uint8_t device;      // Device register
  
   // DWORD 2
-	uint8_t lba3;        // LBA register, 31:24
-	uint8_t lba4;        // LBA register, 39:32
-	uint8_t lba5;        // LBA register, 47:40
-	uint8_t rsv2;        // Reserved
+  uint8_t lba3;        // LBA register, 31:24
+  uint8_t lba4;        // LBA register, 39:32
+  uint8_t lba5;        // LBA register, 47:40
+  uint8_t rsv2;        // Reserved
  
   // DWORD 3
   uint8_t countl;      // Count register, 7:0
@@ -193,39 +193,39 @@ typedef volatile struct {
 } __attribute__((packed)) fis_d2h_t;
 
 typedef volatile struct {
-	// DWORD 0
-	uint8_t  fis_type;	// FIS_TYPE_PIO_SETUP
+  // DWORD 0
+  uint8_t  fis_type;	// FIS_TYPE_PIO_SETUP
  
-	uint8_t  pmport:4;	// Port multiplier
-	uint8_t  rsv0:1;		// Reserved
-	uint8_t  d:1;		// Data transfer direction, 1 - device to host
-	uint8_t  i:1;		// Interrupt bit
-	uint8_t  rsv1:1;
+  uint8_t  pmport:4;	// Port multiplier
+  uint8_t  rsv0:1;		// Reserved
+  uint8_t  d:1;		// Data transfer direction, 1 - device to host
+  uint8_t  i:1;		// Interrupt bit
+  uint8_t  rsv1:1;
  
-	uint8_t  status;		// Status register
-	uint8_t  error;		// Error register
+  uint8_t  status;		// Status register
+  uint8_t  error;		// Error register
  
-	// DWORD 1
-	uint8_t  lba0;		// LBA low register, 7:0
-	uint8_t  lba1;		// LBA mid register, 15:8
-	uint8_t  lba2;		// LBA high register, 23:16
-	uint8_t  device;		// Device register
+  // DWORD 1
+  uint8_t  lba0;		// LBA low register, 7:0
+  uint8_t  lba1;		// LBA mid register, 15:8
+  uint8_t  lba2;		// LBA high register, 23:16
+  uint8_t  device;		// Device register
  
-	// DWORD 2
-	uint8_t  lba3;		// LBA register, 31:24
-	uint8_t  lba4;		// LBA register, 39:32
-	uint8_t  lba5;		// LBA register, 47:40
-	uint8_t  rsv2;		// Reserved
+  // DWORD 2
+  uint8_t  lba3;		// LBA register, 31:24
+  uint8_t  lba4;		// LBA register, 39:32
+  uint8_t  lba5;		// LBA register, 47:40
+  uint8_t  rsv2;		// Reserved
  
-	// DWORD 3
-	uint8_t  countl;		// Count register, 7:0
-	uint8_t  counth;		// Count register, 15:8
-	uint8_t  rsv3;		// Reserved
-	uint8_t  e_status;	// New value of status register
+  // DWORD 3
+  uint8_t  countl;		// Count register, 7:0
+  uint8_t  counth;		// Count register, 15:8
+  uint8_t  rsv3;		// Reserved
+  uint8_t  e_status;	// New value of status register
  
-	// DWORD 4
-	uint16_t tc;		// Transfer count
-	uint8_t  rsv4[2];	// Reserved
+  // DWORD 4
+  uint16_t tc;		// Transfer count
+  uint8_t  rsv4[2];	// Reserved
 } __attribute__((packed)) fis_pio_setup_t;;
 
 typedef volatile struct {
@@ -664,17 +664,17 @@ static inline int controller_irq_setup(ahci_controller_state_t *c) {
   uint64_t nvecs = c->pdev->msi.num_vectors_needed;
   uint64_t base_vec = 0;
 
-	if (idt_find_and_reserve_range(nvecs, 1, &base_vec)) {
-	    ERROR("could not find %d interrupt vectors for controller\n", nvecs);
+  if (idt_find_and_reserve_range(nvecs, 1, &base_vec)) {
+      ERROR("could not find %d interrupt vectors for controller\n", nvecs);
       return -1;
-	}
+  }
 
   DEBUG("irq vectors are %d to %d\n", base_vec, base_vec + nvecs - 1);
 
-	if (pci_dev_enable_msi(c->pdev, base_vec, nvecs, 0)) {
-	    ERROR("could not enable msi for controller\n");
-	    return -1;
-	}
+  if (pci_dev_enable_msi(c->pdev, base_vec, nvecs, 0)) {
+      ERROR("could not enable msi for controller\n");
+      return -1;
+  }
 
   for (int i = base_vec; i < (base_vec + nvecs); i++) {
     if (register_int_handler(i, ahci_handle_irq, c)) {
@@ -686,7 +686,8 @@ static inline int controller_irq_setup(ahci_controller_state_t *c) {
   for (int i = base_vec; i < (base_vec + nvecs); i++) {
     if (pci_dev_unmask_msi(c->pdev, i)) {
       ERROR("could not unmask interrupt vector %d\n", i);
-		}
+      return -1;
+    }
   }
 
   return 0;
