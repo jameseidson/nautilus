@@ -1,3 +1,4 @@
+#include "nautilus/spinlock.h"
 #include <nautilus/nautilus.h>
 #include <nautilus/cpu.h>
 #include <nautilus/mm.h>
@@ -23,6 +24,9 @@
 #define LOCK_CONF          uint8_t _state_lock_flags
 #define LOCK_ACQUIRE(lock) _state_lock_flags = spin_lock_irq_save(&(lock))
 #define LOCK_RELEASE(lock) spin_unlock_irq_restore(&(lock), _state_lock_flags)
+
+#define ATOMIC_LOAD(srcptr)          __atomic_load_n(srcptr, __ATOMIC_SEQ_CST)
+#define ATOMIC_STORE(destptr, value) __atomic_store_n(destptr, value, __ATOMIC_SEQ_CST)
 
 #define PCI_INTEL_VENDOR_ID     0x8086  // intel
 #define PCI_ICH9_DEVICE_ID      0x2922  // ICH9
@@ -194,38 +198,38 @@ typedef volatile struct {
 
 typedef volatile struct {
   // DWORD 0
-  uint8_t  fis_type;	// FIS_TYPE_PIO_SETUP
+  uint8_t fis_type;	// FIS_TYPE_PIO_SETUP
  
-  uint8_t  pmport:4;	// Port multiplier
-  uint8_t  rsv0:1;		// Reserved
-  uint8_t  d:1;		// Data transfer direction, 1 - device to host
-  uint8_t  i:1;		// Interrupt bit
-  uint8_t  rsv1:1;
+  uint8_t pmport:4;	// Port multiplier
+  uint8_t rsv0:1;		// Reserved
+  uint8_t d:1;		// Data transfer direction, 1 - device to host
+  uint8_t i:1;		// Interrupt bit
+  uint8_t rsv1:1;
  
-  uint8_t  status;		// Status register
-  uint8_t  error;		// Error register
+  uint8_t status;		// Status register
+  uint8_t error;		// Error register
  
   // DWORD 1
-  uint8_t  lba0;		// LBA low register, 7:0
-  uint8_t  lba1;		// LBA mid register, 15:8
-  uint8_t  lba2;		// LBA high register, 23:16
-  uint8_t  device;		// Device register
+  uint8_t lba0;		// LBA low register, 7:0
+  uint8_t lba1;		// LBA mid register, 15:8
+  uint8_t lba2;		// LBA high register, 23:16
+  uint8_t device;		// Device register
  
   // DWORD 2
-  uint8_t  lba3;		// LBA register, 31:24
-  uint8_t  lba4;		// LBA register, 39:32
-  uint8_t  lba5;		// LBA register, 47:40
-  uint8_t  rsv2;		// Reserved
+  uint8_t lba3;		// LBA register, 31:24
+  uint8_t lba4;		// LBA register, 39:32
+  uint8_t lba5;		// LBA register, 47:40
+  uint8_t rsv2;		// Reserved
  
   // DWORD 3
-  uint8_t  countl;		// Count register, 7:0
-  uint8_t  counth;		// Count register, 15:8
-  uint8_t  rsv3;		// Reserved
-  uint8_t  e_status;	// New value of status register
+  uint8_t countl;		// Count register, 7:0
+  uint8_t counth;		// Count register, 15:8
+  uint8_t rsv3;		// Reserved
+  uint8_t e_status;	// New value of status register
  
   // DWORD 4
   uint16_t tc;		// Transfer count
-  uint8_t  rsv4[2];	// Reserved
+  uint8_t rsv4[2];	// Reserved
 } __attribute__((packed)) fis_pio_setup_t;;
 
 typedef volatile struct {
@@ -516,6 +520,7 @@ typedef struct ahci_port_state {
 
   // response from ata identify, stored here to ensure it doesn't leak
   uint16_t __attribute__((aligned(2))) *ata_identity;
+  int identified;
 
   // the inherited interface
   struct nk_block_dev *blkdev;
@@ -716,7 +721,7 @@ static inline int port_issue_cmd(ahci_port_state_t *p, fis_h2d_t cmdfis, ahci_cm
   cmdhdr->prdtl = ((nblks - 1) / PRDT_MAX_NBLKS) + 1;
   cmdhdr->c = 1;
   cmdhdr->w = cmdfis.command == ATA_CMD_WRITE_DMA_EXT;
-  cmdhdr->a = cmdfis.command == (ATA_CMD_IDENTIFY_PIO || ATA_CMD_IDENTIFY_DMA);
+  cmdhdr->a = cmdfis.command == (ATA_CMD_IDENTIFY_PIO | ATA_CMD_IDENTIFY_DMA);
 
   cmd_table_t *cmdtbl = cmdhdr->ctba;
   memset(cmdtbl, 0, sizeof(cmd_table_t));
@@ -808,11 +813,7 @@ static void port_identify_callback(nk_block_dev_status_t status, void *context) 
 
   DEBUG("[port %d] lba48 supported, device has %d blocks\n", p->num, p->chars.num_blocks);
 
-  // register the device (TODO: is this safe to call in an interrupt context?)
-  char name[32];
-  sprintf(name, "ahci-%d-%d", p->num, p->type);
-  INFO("[port %d] initializing block device %s with type %d\n", p->num, name, p->type);
-  p->blkdev = nk_block_dev_register(name, 0, &interface, p);
+  ATOMIC_STORE(&p->identified, 1);
 }
 
 static int port_identify(ahci_port_state_t *p) {
@@ -882,6 +883,7 @@ static int port_init(ahci_controller_state_t *c, ahci_dev_t type, int num) {
     return -1;
   }
   memset(p->ata_identity, 0, ATA_BLKSIZE);
+  p->identified = 0;
   p->type = type;
   p->num = num;
   p->regs = regs;
@@ -920,12 +922,19 @@ static int probe(ahci_controller_state_t *c) {
           // enable interrupts
           p->regs->ie = (PORT_IE_D2H | PORT_IE_PIO_SETUP | PORT_IE_TF_ERR);
           
-          // send ata identify command, nonblocking
           if (port_identify(p)) {
             ERROR("[port %d] failed to identify\n", i);
             return -1;
           }
 
+          // block until identified, then register the device
+          DEBUG("[port %d], waiting for identification...\n", p->num);
+          while (!ATOMIC_LOAD(&p->identified));
+
+          char name[32];
+          sprintf(name, "ahci-%d-%d", p->num, p->type);
+          INFO("[port %d] initializing block device %s with type %d\n", p->num, name, p->type);
+          p->blkdev = nk_block_dev_register(name, 0, &interface, p);
           break;
         } default: {
           // only support SATA devices
