@@ -520,7 +520,7 @@ typedef struct ahci_port_state {
 
   // response from ata identify, stored here to ensure it doesn't leak
   uint16_t __attribute__((aligned(2))) *ata_identity;
-  int identified;
+  volatile int identified;
 
   // the inherited interface
   struct nk_block_dev *blkdev;
@@ -989,8 +989,6 @@ static int controller_init(ahci_controller_state_t *c, struct naut_info *naut) {
         cmdreg |= ATA_CFG_CMD_IOSPACE | ATA_CFG_CMD_MEMSPACE | ATA_CFG_CMD_BUSMASTER;
         cmdreg &= ~ATA_CFG_CMD_IRQ_DISABLE;
         pci_cfg_writew(bus->num, pdev->num, 0, 0x4, cmdreg);
-
-        uint16_t stat = pci_cfg_readw(bus->num, pdev->num, 0, 0x6);
       }
     }
   }
